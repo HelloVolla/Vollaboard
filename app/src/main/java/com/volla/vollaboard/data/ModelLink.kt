@@ -10,6 +10,10 @@ enum class ModelLink(
     val link: String,
     val locale: Locale
 ) {
+    WHISPER(
+        "src/assets/whisper-tiny.tflite",
+        Locale.ROOT,
+    ),
     ENGLISH_US(
         "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
         Locale.US
@@ -96,5 +100,5 @@ enum class ModelLink(
     );
 
     val filename: String
-        get() = link.substring(link.lastIndexOf('/') + 1, link.lastIndexOf('.'))
+        get() = if (this == WHISPER) "whisper-tiny" else link.substring(link.lastIndexOf('/') + 1, link.lastIndexOf('.'))
 }
