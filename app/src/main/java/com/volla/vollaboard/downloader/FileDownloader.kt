@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import com.volla.vollaboard.data.ModelLink
+import com.volla.vollaboard.data.ModelType
 import com.volla.vollaboard.downloader.messages.ModelInfo
 import java.util.*
 
@@ -16,6 +17,7 @@ object FileDownloader {
     const val DOWNLOAD_URL = "download_url"
     const val DOWNLOAD_FILENAME = "download_filename"
     const val DOWNLOAD_LOCALE = "download_locale"
+    const val DOWNLOAD_MODEL_TYPE = "download_model_type"
 
     const val UNZIP_URI = "unzip_uri"
     const val UNZIP_LOCALE = "unzip_locale"
@@ -27,10 +29,14 @@ object FileDownloader {
         } else {
             intent.getSerializableExtra(DOWNLOAD_LOCALE) as Locale?
         }
+        val modelType = intent.getStringExtra(DOWNLOAD_MODEL_TYPE)
+            ?.let { runCatching { ModelType.valueOf(it) }.getOrNull() }
+            ?: ModelType.VoskLocal
         return if (url == null || filename == null || locale == null) null else ModelInfo(
             url,
             filename,
-            locale
+            locale,
+            modelType
         )
     }
 
@@ -42,6 +48,7 @@ object FileDownloader {
         serviceIntent.putExtra(DOWNLOAD_URL, model.link)
         serviceIntent.putExtra(DOWNLOAD_FILENAME, model.filename)
         serviceIntent.putExtra(DOWNLOAD_LOCALE, model.locale)
+        serviceIntent.putExtra(DOWNLOAD_MODEL_TYPE, model.modelType.name)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(serviceIntent)
         } else {

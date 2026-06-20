@@ -8,12 +8,15 @@ import com.volla.vollaboard.recognition.recognizers.RecognizerSource
 
 class Providers(context: Context) {
     private val voskLocalProvider: VoskLocalProvider
+    private val whisperLocalProvider: WhisperLocalProvider
     private val providers: List<RecognizerSourceProvider>
 
     init {
         val providersM = mutableListOf<RecognizerSourceProvider>()
         voskLocalProvider = VoskLocalProvider(context)
+        whisperLocalProvider = WhisperLocalProvider(context)
         providersM.add(voskLocalProvider)
+        providersM.add(whisperLocalProvider)
         if (Tools.VOSK_SERVER_ENABLED) {
             providersM.add(VoskServerProvider())
         }
@@ -23,7 +26,7 @@ class Providers(context: Context) {
     fun recognizerSourceForModel(localModel: InstalledModelReference): RecognizerSource? {
         return when (localModel.type) {
             ModelType.VoskLocal -> voskLocalProvider.recognizerSourceForModel(localModel)
-            else -> null
+            ModelType.WHISPER   -> whisperLocalProvider.recognizerSourceForModel(localModel)
         }
     }
 
