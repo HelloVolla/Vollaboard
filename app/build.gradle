@@ -3,6 +3,14 @@ apply plugin: 'com.google.protobuf'
 apply plugin: 'org.jetbrains.kotlin.android'
 apply plugin: 'org.jetbrains.kotlin.plugin.serialization'
 
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { stream ->
+        keystoreProperties.load(stream)
+    }
+}
 
 android {
     compileSdk 34
@@ -10,15 +18,26 @@ android {
         applicationId "com.volla.vollaboard"
         minSdkVersion 23
         targetSdkVersion 35
-        versionCode 402010
+        versionCode 402020
         versionName "v4.2.2"
         ndkVersion "r25c"
         ndk {
         abiFilters "arm64-v8a"
       }
     }
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile rootProject.file(keystoreProperties["storeFile"])
+                storePassword keystoreProperties["storePassword"]
+                keyAlias keystoreProperties["keyAlias"]
+                keyPassword keystoreProperties["keyPassword"]
+            }
+        }
+    }
     buildTypes {
         release {
+            signingConfig signingConfigs.release
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
