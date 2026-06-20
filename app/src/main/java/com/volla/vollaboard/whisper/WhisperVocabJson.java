@@ -2,7 +2,6 @@ package com.volla.vollaboard.whisper;
 
 import android.util.Log;
 
-import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -52,11 +51,11 @@ public class WhisperVocabJson {
         String json = readFile(new File(modelDir, "added_tokens.json"));
         String langToken = "<|" + langCode + "|>";
         try {
-            JSONArray arr = new JSONArray(json);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject tok = arr.getJSONObject(i);
-                int id = tok.getInt("id");
-                String content = tok.getString("content");
+            JSONObject obj = new JSONObject(json);
+            Iterator<String> keys = obj.keys();
+            while (keys.hasNext()) {
+                String content = keys.next();
+                int id = obj.getInt(content);
                 tokenToWord.put(id, content);
                 switch (content) {
                     case "<|endoftext|>":         tokenEOT = id;           break;
