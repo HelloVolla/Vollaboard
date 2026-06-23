@@ -18,34 +18,58 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Whisper inference engine for the split-model format:
- *   whisper_mel_extractor.tflite — raw audio → mel spectrogram
- *   whisper_encoder.tflite       — mel spectrogram → encoder hidden states
- *   whisper_decoder.tflite       — (encoder states + tokens) → next-token logits
+ * Whisper inference engine for the split-model TFLite format:
+ *   whisper_mel_extractor.tflite — raw audio → log-mel spectrogram
+ *   whisper_encoder.tflite       — log-mel → encoder hidden states
+ *   whisper_decoder.tflite       — (encoder states + token window) → logits
  *
- * At initialisation the tensor shapes of all three models are logged so that
- * mismatches can be diagnosed quickly during integration.
+ * The decoder is a fixed-length, non-cached model:
+ *   inputs : encoder_hidden_states [1, 1500, 384]
+ *            input_ids             [1, SEQ]   (SEQ is fixed, e.g. 32)
+ *            attention_mask        [1, SEQ]
+ *   output : logits               [1, SEQ, vocab]
+ *
+ * Decoding re-feeds the whole token sequence (prompt + generated so far) every
+ * step, right-padded to SEQ, with the attention mask marking valid positions.
+ * The next token is the argmax of the logits row at the last valid position.
  */
 public class WhisperSplitEngine {
     private static final String TAG = "WhisperSplitEngine";
 
     public static final int SAMPLE_RATE = 16000;
-    private static final int CHUNK_SAMPLES = SAMPLE_RATE * 30; // 30-second window
-    private static final int MAX_DECODE_STEPS = 224;
+
+    // Audio level handling. Whisper hallucinates non-speech tags ("[Musik]")
+    // when fed near-silence, so we gate out quiet chunks and normalise gain so
+    // quiet-but-real speech reaches the model at a usable level.
+    private static final float SILENCE_RMS  = 0.004f;  // below this → treat as silence
+    private static final float TARGET_PEAK  = 0.40f;   // normalise loudest sample to this
+    private static final float MAX_GAIN     = 30.0f;   // cap amplification of quiet input
 
     private Interpreter melExtractor;
     private Interpreter encoder;
     private Interpreter decoder;
     private WhisperVocabJson vocab;
 
-    // Detected at init: whether the decoder takes encoder output as an explicit input.
-    // false → tokens only (encoder output baked into model constants or KV-cache)
-    // true  → encoder output as first float32 input, tokens as int32 input
-    private boolean decoderNeedsEncoderInput;
-    private int decoderEncoderInputIdx;
-    private int decoderTokenInputIdx;
+    // Number of PCM samples the mel extractor consumes per call (read at init).
+    private int melInputSamples = SAMPLE_RATE;
+
+    // Decoder input/output indices, discovered by tensor name at init.
+    private int encoderStateIdx  = -1;
+    private int inputIdsIdx       = -1;
+    private int attentionMaskIdx  = -1;
+    private int logitsOutputIdx   = -1;
+
+    // Fixed decoder sequence length (input_ids dimension, e.g. 32).
+    private int decoderSeqLen = 0;
 
     private boolean initialized = false;
+
+    public int  getMelInputSamples() { return melInputSamples; }
+    public boolean isInitialized()   { return initialized; }
+
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
 
     public boolean initialize(String modelDir, String langCode) throws IOException {
         vocab = new WhisperVocabJson();
@@ -63,12 +87,13 @@ public class WhisperSplitEngine {
         logShapes("encoder",       encoder);
         logShapes("decoder",       decoder);
 
-        detectDecoderInputLayout();
+        melInputSamples = elemCount(melExtractor.getInputTensor(0).shape());
+        Log.d(TAG, "mel extractor expects " + melInputSamples + " samples per call");
+
+        detectDecoderLayout();
         initialized = true;
         return true;
     }
-
-    public boolean isInitialized() { return initialized; }
 
     public void deinitialize() {
         if (melExtractor != null) { melExtractor.close(); melExtractor = null; }
@@ -77,15 +102,38 @@ public class WhisperSplitEngine {
         initialized = false;
     }
 
-    /**
-     * Transcribe a float PCM buffer (values in [-1, 1], 16 kHz mono).
-     * The buffer is zero-padded or trimmed to exactly 30 seconds before inference.
-     */
+    // =========================================================================
+    // Public entry point
+    // =========================================================================
+
     public String transcribeBuffer(float[] samples) {
         if (!initialized) return "";
 
-        float[] padded = new float[CHUNK_SAMPLES];
-        System.arraycopy(samples, 0, padded, 0, Math.min(samples.length, CHUNK_SAMPLES));
+        int validLen = Math.min(samples.length, melInputSamples);
+
+        // Measure level on the valid (non-padding) portion.
+        float peak = 0f;
+        double sumSq = 0;
+        for (int i = 0; i < validLen; i++) {
+            float v = samples[i];
+            float a = Math.abs(v);
+            if (a > peak) peak = a;
+            sumSq += (double) v * v;
+        }
+        float rms = (float) Math.sqrt(sumSq / Math.max(1, validLen));
+
+        // Gate out near-silent chunks — feeding them produces "[Musik]" etc.
+        if (rms < SILENCE_RMS) {
+            Log.d(TAG, String.format("skip near-silent chunk (rms=%.4f peak=%.4f)", rms, peak));
+            return "";
+        }
+
+        // Normalise gain so quiet speech reaches the model at a usable level.
+        float gain = (peak > 1e-6f) ? Math.min(TARGET_PEAK / peak, MAX_GAIN) : 1f;
+        float[] padded = new float[melInputSamples];
+        for (int i = 0; i < validLen; i++) padded[i] = samples[i] * gain;
+
+        Log.d(TAG, String.format("audio in: rms=%.4f peak=%.4f gain=%.1f", rms, peak, gain));
 
         float[] mel = runMelExtractor(padded);
         if (mel == null) return "";
@@ -96,68 +144,65 @@ public class WhisperSplitEngine {
         return greedyDecode(encoderOut);
     }
 
-    // -------------------------------------------------------------------------
-    // Mel extraction
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Mel extractor
+    // =========================================================================
 
     private float[] runMelExtractor(float[] samples) {
         ByteBuffer inputBuf = floatArrayToBuffer(samples);
-
-        Tensor outTensor = melExtractor.getOutputTensor(0);
-        int outSize = elemCount(outTensor.shape());
+        int outSize = elemCount(melExtractor.getOutputTensor(0).shape());
         ByteBuffer outputBuf = ByteBuffer.allocateDirect(outSize * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
-
         try {
             melExtractor.run(inputBuf, outputBuf);
         } catch (Exception e) {
-            Log.e(TAG, "mel_extractor inference failed", e);
+            Log.e(TAG, "mel_extractor failed", e);
             return null;
         }
-
         return bufferToFloatArray(outputBuf, outSize);
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Encoder
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     private float[] runEncoder(float[] mel) {
         ByteBuffer inputBuf = floatArrayToBuffer(mel);
-
-        Tensor outTensor = encoder.getOutputTensor(0);
-        int outSize = elemCount(outTensor.shape());
+        int outSize = elemCount(encoder.getOutputTensor(0).shape());
         ByteBuffer outputBuf = ByteBuffer.allocateDirect(outSize * Float.BYTES)
                 .order(ByteOrder.nativeOrder());
-
         try {
             encoder.run(inputBuf, outputBuf);
         } catch (Exception e) {
-            Log.e(TAG, "encoder inference failed", e);
+            Log.e(TAG, "encoder failed", e);
             return null;
         }
-
         return bufferToFloatArray(outputBuf, outSize);
     }
 
-    // -------------------------------------------------------------------------
-    // Greedy decoder
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Greedy decoder (fixed-length, re-feed each step)
+    // =========================================================================
 
     private String greedyDecode(float[] encoderOut) {
         List<Integer> tokens = new ArrayList<>();
-        tokens.add(vocab.tokenSOT);
-        if (vocab.tokenLang != -1) tokens.add(vocab.tokenLang);
-        tokens.add(vocab.tokenTranscribe);
-        tokens.add(vocab.tokenNoTimestamps);
+        for (int t : buildPrompt()) tokens.add(t);
 
-        StringBuilder result = new StringBuilder();
+        StringBuilder result   = new StringBuilder();
+        StringBuilder debugIds = new StringBuilder();
 
-        for (int step = 0; step < MAX_DECODE_STEPS; step++) {
+        // We can generate until the fixed window is full.
+        while (tokens.size() < decoderSeqLen) {
             int next = decoderStep(encoderOut, tokens);
+
+            if (debugIds.length() < 200) {
+                debugIds.append(next).append("('")
+                        .append(vocab.tokenToWord.get(next)).append("') ");
+            }
+
             if (next < 0 || next == vocab.tokenEOT) break;
 
-            // Append word-piece text; skip control/special tokens above EOT
+            // Skip special tokens (>= EOT) from the visible text.
             if (next < vocab.tokenEOT) {
                 String word = vocab.tokenToWord.get(next);
                 if (word != null) result.append(word);
@@ -165,96 +210,184 @@ public class WhisperSplitEngine {
             tokens.add(next);
         }
 
-        return result.toString().trim();
+        Log.d(TAG, "Predicted tokens: " + debugIds);
+        Log.d(TAG, "Decoded text: '" + result + "'");
+        return cleanNonSpeech(decodeBpe(result.toString()).trim());
     }
 
+    /**
+     * Strips Whisper's non-speech annotations — bracketed/parenthesised tags
+     * such as "[Musik]", "[Applaus]", "(Gelächter)" and musical-note glyphs —
+     * which the model emits for music/noise rather than spoken words.
+     */
+    private static String cleanNonSpeech(String text) {
+        String cleaned = text
+                .replaceAll("\\[[^\\]]*\\]", "")
+                .replaceAll("\\([^\\)]*\\)", "")
+                .replaceAll("[♪♫]", "")
+                .replaceAll("\\s+", " ")
+                .trim();
+        return cleaned;
+    }
+
+    private int[] buildPrompt() {
+        List<Integer> p = new ArrayList<>();
+        p.add(vocab.tokenSOT);
+        if (vocab.tokenLang != -1) p.add(vocab.tokenLang);
+        p.add(vocab.tokenTranscribe);
+        p.add(vocab.tokenNoTimestamps);
+        return toIntArray(p);
+    }
+
+    /**
+     * One decode step.  Feeds the whole token sequence (right-padded to the
+     * decoder's fixed SEQ length) plus the attention mask and encoder states,
+     * then returns the argmax token at the last valid position.
+     */
     private int decoderStep(float[] encoderOut, List<Integer> tokens) {
-        int nTokens = tokens.size();
+        int n = tokens.size();                 // valid tokens (<= decoderSeqLen)
+        int inputCount = decoder.getInputTensorCount();
 
-        // Build token int32 buffer
-        ByteBuffer tokenBuf = ByteBuffer.allocateDirect(nTokens * Integer.BYTES)
+        // input_ids (int32, right-padded with 0 — matches the reference pipeline)
+        ByteBuffer idsBuf = ByteBuffer.allocateDirect(decoderSeqLen * Integer.BYTES)
                 .order(ByteOrder.nativeOrder());
-        for (int t : tokens) tokenBuf.putInt(t);
+        for (int i = 0; i < decoderSeqLen; i++) {
+            idsBuf.putInt(i < n ? tokens.get(i) : 0);
+        }
+        idsBuf.rewind();
 
-        // Resize the token input to current sequence length, then re-allocate tensors
-        decoder.resizeInput(decoderTokenInputIdx, new int[]{1, nTokens});
-        decoder.allocateTensors();
-
-        // Determine output size after resize (vocab dimension is fixed, sequence dim varies)
-        Tensor outTensor = decoder.getOutputTensor(0);
-        int outSize = elemCount(outTensor.shape());
-        ByteBuffer outputBuf = ByteBuffer.allocateDirect(outSize * Float.BYTES)
+        // attention_mask (int32, 1 for valid positions, 0 for padding)
+        ByteBuffer maskBuf = ByteBuffer.allocateDirect(decoderSeqLen * Integer.BYTES)
                 .order(ByteOrder.nativeOrder());
+        for (int i = 0; i < decoderSeqLen; i++) {
+            maskBuf.putInt(i < n ? 1 : 0);
+        }
+        maskBuf.rewind();
+
+        Object[] inputs = new Object[inputCount];
+        inputs[encoderStateIdx] = floatArrayToBuffer(encoderOut);
+        inputs[inputIdsIdx]     = idsBuf;
+        if (attentionMaskIdx >= 0) inputs[attentionMaskIdx] = maskBuf;
+
+        int vocabSize = lastDim(decoder.getOutputTensor(logitsOutputIdx).shape());
+        ByteBuffer logitsBuf = ByteBuffer.allocateDirect(
+                elemCount(decoder.getOutputTensor(logitsOutputIdx).shape()) * Float.BYTES)
+                .order(ByteOrder.nativeOrder());
+        Map<Integer, Object> outputs = new HashMap<>();
+        outputs.put(logitsOutputIdx, logitsBuf);
 
         try {
-            if (decoderNeedsEncoderInput) {
-                ByteBuffer encoderBuf = floatArrayToBuffer(encoderOut);
-                Object[] inputs = new Object[2];
-                inputs[decoderEncoderInputIdx] = encoderBuf;
-                inputs[decoderTokenInputIdx]   = tokenBuf;
-                Map<Integer, Object> outputs = new HashMap<>();
-                outputs.put(0, outputBuf);
-                decoder.runForMultipleInputsOutputs(inputs, outputs);
-            } else {
-                decoder.run(tokenBuf, outputBuf);
-            }
+            decoder.runForMultipleInputsOutputs(inputs, outputs);
         } catch (Exception e) {
-            Log.e(TAG, "decoder step failed at step tokens=" + nTokens, e);
+            Log.e(TAG, "decoder step failed (n=" + n + ")", e);
             return -1;
         }
 
-        // Logits are shaped [1, nTokens, vocabSize] — take last position
-        int[] outShape = outTensor.shape();
-        int vocabSize = outShape[outShape.length - 1];
-        int lastPosOffset = (nTokens - 1) * vocabSize;
+        // Next-token logits are the row at the last valid position (n - 1).
+        logitsBuf.rewind();
+        logitsBuf.position((n - 1) * vocabSize * Float.BYTES);
 
-        outputBuf.rewind();
-        outputBuf.position(lastPosOffset * Float.BYTES);
-
-        int bestToken = -1;
+        int bestToken  = -1;
         float bestScore = Float.NEGATIVE_INFINITY;
         for (int v = 0; v < vocabSize; v++) {
-            float score = outputBuf.getFloat();
-            if (score > bestScore) {
-                bestScore = score;
-                bestToken = v;
-            }
+            float s = logitsBuf.getFloat();
+            if (s > bestScore) { bestScore = s; bestToken = v; }
         }
         return bestToken;
     }
 
-    // -------------------------------------------------------------------------
-    // Decoder input-layout detection
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Decoder layout detection
+    // =========================================================================
 
-    /**
-     * Inspect the decoder's input tensors to decide whether it expects
-     * (encoder_output, tokens) or just (tokens).  We distinguish by data type:
-     * float32 → encoder output, int32 → token IDs.
-     */
-    private void detectDecoderInputLayout() {
+    private void detectDecoderLayout() {
         int inputCount = decoder.getInputTensorCount();
-        decoderEncoderInputIdx = -1;
-        decoderTokenInputIdx   = 0; // safe default
-
         for (int i = 0; i < inputCount; i++) {
-            Tensor t = decoder.getInputTensor(i);
-            if (t.dataType() == org.tensorflow.lite.DataType.INT32) {
-                decoderTokenInputIdx = i;
-            } else if (t.dataType() == org.tensorflow.lite.DataType.FLOAT32) {
-                decoderEncoderInputIdx = i;
+            String name = decoder.getInputTensor(i).name();
+            if (name.contains("encoder_hidden_states")) {
+                encoderStateIdx = i;
+            } else if (name.contains("input_ids")) {
+                inputIdsIdx   = i;
+                decoderSeqLen = lastDim(decoder.getInputTensor(i).shape());
+            } else if (name.contains("attention_mask")) {
+                attentionMaskIdx = i;
             }
         }
 
-        decoderNeedsEncoderInput = (decoderEncoderInputIdx != -1);
-        Log.d(TAG, "Decoder layout: needsEncoderInput=" + decoderNeedsEncoderInput
-                + " encoderIdx=" + decoderEncoderInputIdx
-                + " tokenIdx=" + decoderTokenInputIdx);
+        int outputCount = decoder.getOutputTensorCount();
+        for (int o = 0; o < outputCount; o++) {
+            int[] shape = decoder.getOutputTensor(o).shape();
+            if (shape.length >= 2 && shape[shape.length - 1] > 50000) {
+                logitsOutputIdx = o;
+                break;
+            }
+        }
+
+        Log.d(TAG, "Decoder layout: encoderStateIdx=" + encoderStateIdx
+                + " inputIdsIdx=" + inputIdsIdx
+                + " maskIdx=" + attentionMaskIdx
+                + " logitsOut=" + logitsOutputIdx
+                + " seqLen=" + decoderSeqLen);
+
+        if (encoderStateIdx < 0 || inputIdsIdx < 0 || logitsOutputIdx < 0 || decoderSeqLen <= 0) {
+            Log.e(TAG, "FATAL: could not resolve required decoder tensors");
+        }
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // BPE detokenisation
+    // =========================================================================
+
+    /**
+     * GPT-2/Whisper byte-level BPE uses the visible marker 'Ġ' for a leading
+     * space and encodes raw UTF-8 bytes through a printable-character map.  The
+     * vocabulary words we appended are those visible tokens; convert them back
+     * to real UTF-8 text here.
+     */
+    private static String decodeBpe(String visible) {
+        // Map each visible char back to its original byte, then UTF-8 decode.
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < visible.length(); i++) {
+            char c = visible.charAt(i);
+            Integer b = BYTE_DECODER.get(c);
+            if (b != null) {
+                bytes.write(b);
+            } else {
+                // Not in the byte map (already plain) — emit its UTF-8 bytes.
+                byte[] raw = String.valueOf(c).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                bytes.write(raw, 0, raw.length);
+            }
+        }
+        return new String(bytes.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    // GPT-2 byte<->unicode table (reverse: visible char -> byte value).
+    private static final Map<Character, Integer> BYTE_DECODER = buildByteDecoder();
+
+    private static Map<Character, Integer> buildByteDecoder() {
+        List<Integer> bs = new ArrayList<>();
+        for (int i = '!'; i <= '~'; i++) bs.add(i);
+        for (int i = 0xA1; i <= 0xAC; i++) bs.add(i);
+        for (int i = 0xAE; i <= 0xFF; i++) bs.add(i);
+        List<Integer> cs = new ArrayList<>(bs);
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if (!bs.contains(b)) {
+                bs.add(b);
+                cs.add(256 + n);
+                n++;
+            }
+        }
+        Map<Character, Integer> decoder = new HashMap<>();
+        for (int i = 0; i < bs.size(); i++) {
+            decoder.put((char) (int) cs.get(i), bs.get(i));
+        }
+        return decoder;
+    }
+
+    // =========================================================================
     // Utilities
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     private static Interpreter loadInterpreter(File file, Interpreter.Options opts)
             throws IOException {
@@ -286,10 +419,35 @@ public class WhisperSplitEngine {
         return n;
     }
 
+    private static int lastDim(int[] shape) {
+        return shape[shape.length - 1];
+    }
+
+    private static int[] toIntArray(List<Integer> list) {
+        int[] arr = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
+        return arr;
+    }
+
+    /** Compact min/max/mean/RMS summary of a float buffer for diagnostics. */
+    private static String stats(float[] a, int validLen) {
+        if (a.length == 0) return "empty";
+        float min = Float.POSITIVE_INFINITY, max = Float.NEGATIVE_INFINITY;
+        double sum = 0, sumSq = 0;
+        for (float v : a) {
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+            sumSq += (double) v * v;
+        }
+        return String.format("len=%d(valid=%d) min=%.4f max=%.4f mean=%.4f rms=%.4f",
+                a.length, validLen, min, max, sum / a.length, Math.sqrt(sumSq / a.length));
+    }
+
     private static void logShapes(String name, Interpreter interp) {
         for (int i = 0; i < interp.getInputTensorCount(); i++) {
             Tensor t = interp.getInputTensor(i);
-            Log.d(TAG, name + " input[" + i + "]: " + t.name()
+            Log.d(TAG, name + " input["  + i + "]: " + t.name()
                     + " shape=" + Arrays.toString(t.shape()) + " type=" + t.dataType());
         }
         for (int i = 0; i < interp.getOutputTensorCount(); i++) {

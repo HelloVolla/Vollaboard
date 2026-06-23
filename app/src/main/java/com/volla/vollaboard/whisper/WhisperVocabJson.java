@@ -14,11 +14,12 @@ import java.util.Map;
 public class WhisperVocabJson {
     private static final String TAG = "WhisperVocabJson";
 
+    // Defaults match standard multilingual Whisper (51865-token vocab).
     public final Map<Integer, String> tokenToWord = new HashMap<>();
-    public int tokenEOT = 50256;
-    public int tokenSOT = 50257;
-    public int tokenTranscribe = 50359;
-    public int tokenNoTimestamps = 50363;
+    public int tokenEOT = 50257;          // <|endoftext|>
+    public int tokenSOT = 50258;          // <|startoftranscript|>
+    public int tokenTranscribe = 50359;   // <|transcribe|>
+    public int tokenNoTimestamps = 50363; // <|notimestamps|>
     public int tokenLang = -1;
 
     public void load(String modelDir, String langCode) throws IOException {

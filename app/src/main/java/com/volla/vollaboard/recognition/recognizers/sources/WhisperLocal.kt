@@ -117,8 +117,8 @@ class WhisperLocal(
         }
 
         companion object {
-            // 3 seconds at 16 kHz — balances latency against Whisper's minimum context
-            private const val CHUNK_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 3
+            // 1 second at 16 kHz — matches the mel extractor's declared input shape [16000]
+            private const val CHUNK_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 1
         }
     }
 
