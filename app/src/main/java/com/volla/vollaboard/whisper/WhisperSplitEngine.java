@@ -3,7 +3,6 @@ package com.volla.vollaboard.whisper;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
-import org.tensorflow.lite.Tensor;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -12,7 +11,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,11 +37,14 @@ public class WhisperSplitEngine {
     public static final int SAMPLE_RATE = 16000;
 
     // Audio level handling. Whisper hallucinates non-speech tags ("[Musik]")
-    // when fed near-silence, so we gate out quiet chunks and normalise gain so
-    // quiet-but-real speech reaches the model at a usable level.
-    private static final float SILENCE_RMS  = 0.004f;  // below this → treat as silence
+    // when fed quiet/noisy audio, so we gate out low-energy chunks and normalise
+    // gain so real speech reaches the model at a usable level. Measured on
+    // device: background noise sits around rms 0.011, real speech around
+    // rms 0.025–0.04, so the gate cleanly separates the two. Gain is capped low
+    // enough that marginal chunks aren't blown up into hallucinations.
+    private static final float SILENCE_RMS  = 0.015f;  // below this → treat as silence
     private static final float TARGET_PEAK  = 0.40f;   // normalise loudest sample to this
-    private static final float MAX_GAIN     = 30.0f;   // cap amplification of quiet input
+    private static final float MAX_GAIN     = 6.0f;    // cap amplification of quiet input
 
     private Interpreter melExtractor;
     private Interpreter encoder;
@@ -83,12 +84,7 @@ public class WhisperSplitEngine {
         encoder      = loadInterpreter(new File(modelDir, "whisper_encoder.tflite"),       opts);
         decoder      = loadInterpreter(new File(modelDir, "whisper_decoder.tflite"),       opts);
 
-        logShapes("mel_extractor", melExtractor);
-        logShapes("encoder",       encoder);
-        logShapes("decoder",       decoder);
-
         melInputSamples = elemCount(melExtractor.getInputTensor(0).shape());
-        Log.d(TAG, "mel extractor expects " + melInputSamples + " samples per call");
 
         detectDecoderLayout();
         initialized = true;
@@ -123,17 +119,12 @@ public class WhisperSplitEngine {
         float rms = (float) Math.sqrt(sumSq / Math.max(1, validLen));
 
         // Gate out near-silent chunks — feeding them produces "[Musik]" etc.
-        if (rms < SILENCE_RMS) {
-            Log.d(TAG, String.format("skip near-silent chunk (rms=%.4f peak=%.4f)", rms, peak));
-            return "";
-        }
+        if (rms < SILENCE_RMS) return "";
 
         // Normalise gain so quiet speech reaches the model at a usable level.
         float gain = (peak > 1e-6f) ? Math.min(TARGET_PEAK / peak, MAX_GAIN) : 1f;
         float[] padded = new float[melInputSamples];
         for (int i = 0; i < validLen; i++) padded[i] = samples[i] * gain;
-
-        Log.d(TAG, String.format("audio in: rms=%.4f peak=%.4f gain=%.1f", rms, peak, gain));
 
         float[] mel = runMelExtractor(padded);
         if (mel == null) return "";
@@ -188,17 +179,11 @@ public class WhisperSplitEngine {
         List<Integer> tokens = new ArrayList<>();
         for (int t : buildPrompt()) tokens.add(t);
 
-        StringBuilder result   = new StringBuilder();
-        StringBuilder debugIds = new StringBuilder();
+        StringBuilder result = new StringBuilder();
 
         // We can generate until the fixed window is full.
         while (tokens.size() < decoderSeqLen) {
             int next = decoderStep(encoderOut, tokens);
-
-            if (debugIds.length() < 200) {
-                debugIds.append(next).append("('")
-                        .append(vocab.tokenToWord.get(next)).append("') ");
-            }
 
             if (next < 0 || next == vocab.tokenEOT) break;
 
@@ -210,8 +195,6 @@ public class WhisperSplitEngine {
             tokens.add(next);
         }
 
-        Log.d(TAG, "Predicted tokens: " + debugIds);
-        Log.d(TAG, "Decoded text: '" + result + "'");
         return cleanNonSpeech(decodeBpe(result.toString()).trim());
     }
 
@@ -222,9 +205,10 @@ public class WhisperSplitEngine {
      */
     private static String cleanNonSpeech(String text) {
         String cleaned = text
-                .replaceAll("\\[[^\\]]*\\]", "")
-                .replaceAll("\\([^\\)]*\\)", "")
-                .replaceAll("[♪♫]", "")
+                .replaceAll("\\[[^\\]]*\\]", "")   // [Musik]
+                .replaceAll("\\([^\\)]*\\)", "")   // (Gelächter)
+                .replaceAll("\\*[^*]*\\*", "")     // * Musik *
+                .replaceAll("[♪♫*]", "")           // stray notes / asterisks
                 .replaceAll("\\s+", " ")
                 .trim();
         return cleaned;
@@ -427,33 +411,5 @@ public class WhisperSplitEngine {
         int[] arr = new int[list.size()];
         for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
         return arr;
-    }
-
-    /** Compact min/max/mean/RMS summary of a float buffer for diagnostics. */
-    private static String stats(float[] a, int validLen) {
-        if (a.length == 0) return "empty";
-        float min = Float.POSITIVE_INFINITY, max = Float.NEGATIVE_INFINITY;
-        double sum = 0, sumSq = 0;
-        for (float v : a) {
-            if (v < min) min = v;
-            if (v > max) max = v;
-            sum += v;
-            sumSq += (double) v * v;
-        }
-        return String.format("len=%d(valid=%d) min=%.4f max=%.4f mean=%.4f rms=%.4f",
-                a.length, validLen, min, max, sum / a.length, Math.sqrt(sumSq / a.length));
-    }
-
-    private static void logShapes(String name, Interpreter interp) {
-        for (int i = 0; i < interp.getInputTensorCount(); i++) {
-            Tensor t = interp.getInputTensor(i);
-            Log.d(TAG, name + " input["  + i + "]: " + t.name()
-                    + " shape=" + Arrays.toString(t.shape()) + " type=" + t.dataType());
-        }
-        for (int i = 0; i < interp.getOutputTensorCount(); i++) {
-            Tensor t = interp.getOutputTensor(i);
-            Log.d(TAG, name + " output[" + i + "]: " + t.name()
-                    + " shape=" + Arrays.toString(t.shape()) + " type=" + t.dataType());
-        }
     }
 }
