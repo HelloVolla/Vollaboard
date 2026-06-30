@@ -3,12 +3,10 @@ package com.volla.vollaboard.data
 import java.util.*
 
 // Locale list available at: https://stackoverflow.com/questions/7973023/what-is-the-list-of-supported-languages-locales-on-android
-/**
- *
- */
 enum class ModelLink(
     val link: String,
-    val locale: Locale
+    val locale: Locale,
+    val modelType: ModelType = ModelType.VoskLocal
 ) {
     ENGLISH_US(
         "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
@@ -31,8 +29,9 @@ enum class ModelLink(
         Locale.FRENCH
     ),
     GERMAN(
-        "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip",
-        Locale.GERMAN
+        "https://volla.tech/filedump/small-germany.zip",
+        Locale.GERMAN,
+        ModelType.WHISPER
     ),
     SPANISH(
         "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip",

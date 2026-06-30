@@ -41,6 +41,7 @@ object ZipTools {
         val size = zipfile.size().toDouble()
 
         var foundAmFinalMDL = false
+        var foundWhisperModel = false
         var i = 0
         while (e.hasMoreElements()) {
             progressObserver.onChanged(i / size)
@@ -54,23 +55,25 @@ object ZipTools {
                 }
             }
 
-            // Some tests to make sure it actually is a Vosk model
+            // Vosk model signature
             if (!foundAmFinalMDL && entry.name.endsWith("/am/final.mdl")) {
                 foundAmFinalMDL = true
             }
-
-            // outdated, but final.mdl might be elsewhere
             if (!foundAmFinalMDL && entry.name.endsWith("/final.mdl")) {
                 foundAmFinalMDL = true
+            }
+
+            // Whisper split model signature
+            if (!foundWhisperModel && entry.name.endsWith("whisper_encoder.tflite")) {
+                foundWhisperModel = true
             }
 
             unzipEntry(zipfile, entry, tempUnzipLocation.absolutePath)
             i++
         }
 
-        if (!foundAmFinalMDL) {
-            // Not a Vosk model!
-            Log.e(TAG, "Not a Vosk model: ${archive.absolutePath}")
+        if (!foundAmFinalMDL && !foundWhisperModel) {
+            Log.e(TAG, "Not a recognised model zip: ${archive.absolutePath}")
             errorObserver?.onChanged("Zip is not a Vosk model!")
             tempUnzipLocation.delete()
             return

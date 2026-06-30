@@ -5,3 +5,4 @@
 -dontwarn java.awt.GraphicsEnvironment
 -dontwarn java.awt.HeadlessException
 -dontwarn java.awt.Window
+-dontwarn android.media.AudioAttributes
