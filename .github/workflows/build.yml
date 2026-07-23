@@ -2,31 +2,57 @@ name: Android CI
 
 on:
   push:
-    branches: [ "volla-14" ]
+    branches: [ "main" ]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-[a-z]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-[a-z]+.[0-9]+'
   pull_request:
-    branches: [ "volla-14" ]
+    branches: [ "main" ]
 
 jobs:
-  build:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions: write-all
     runs-on: ubuntu-latest
+    outputs:
+      releaseId: ${{ steps.step1.outputs.id }}
+    steps:
+      - id: step1
+        uses: ncipollo/release-action@v1
+        with:
+          name: "Vollaboard ${{ github.ref_name }}"
+          body: |
+            See the assets to download this version and install.
+          prerelease: false
+          draft: false
+
+  build:
+    needs: [create-release]
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    permissions: write-all
+    runs-on: [self-hosted, yolo]
+    container:
+      image: docker://fabernovel/android:api-34-v1.8.0
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: gradle
+      - name: Jenv
+        run: |
+          eval "$(jenv init -)"
+          jenv global 17
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
+            /root/.gradle/caches
+            /root/.gradle/wrapper
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
@@ -34,59 +60,32 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Create keystore file and properties from secrets
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_FILE_CONTENTS }}" | base64 --decode > keystore.jks
+          cat > keystore.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASS }}
+          keyAlias=${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEYSTORE_PASS }}
+          EOF
+
       - name: Build with Gradle
         run: |
           ./gradlew build
           mkdir -p releases
-          find app/build/ -type f -name "Vollaboard_Universal.apk" -exec mv {} releases/com.volla.vollaboard.apk \;
+          find app/build/ -type f -name "Vollaboard_Universal.apk" -exec mv {} releases/com.volla.vollaboard-signed.apk \;
           ls -l releases
 
-      - name: Install Android SDK Build-Tools
-        uses: android-actions/setup-android@v2
-        with:
-          api-level: 33
-          build-tools: 33.0.0
-
-      # Decode the base64 keystore and save it as keystore.jks
-      - name: Create keystore file from base64
-        run: |
-          echo "${{ secrets.ANDROID_KEYSTORE_FILE_CONTENTS }}" | base64 --decode > keystore.jks
-
-      - name: Align APK
-        run: |
-          ${ANDROID_HOME}/build-tools/33.0.0/zipalign -v 4 releases/com.volla.vollaboard.apk releases/com.volla.vollaboard-aligned.apk
-        shell: bash
-
-      - name: Sign APK manually
-        run: |
-          ${ANDROID_HOME}/build-tools/33.0.0/apksigner sign --ks keystore.jks --ks-key-alias ${{ secrets.ANDROID_KEYSTORE_ALIAS }} --ks-pass pass:${{ secrets.ANDROID_KEYSTORE_PASS }} --key-pass pass:${{ secrets.ANDROID_KEYSTORE_PASS }} --out releases/com.volla.vollaboard-signed.apk releases/com.volla.vollaboard-aligned.apk
-        shell: bash
-
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: com.volla.vollaboard-signed.apk
           path: releases/com.volla.vollaboard-signed.apk
-          
-      - name: Upload Apk to Nightly Repository
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        uses: wlixcc/SFTP-Deploy-Action@v1.0
-        with:
-          username: 'drone'
-          server: 'volla.tech'
-          port: 22
-          ssh_private_key: '${{ secrets.FDROID_DEPLOY_KEY }}'
-          local_path: releases/com.volla.vollaboard-signed.apk
-          remote_path: '/fdroid-nightly.volla.tech/builds/volla/vollaboard/'
-          args: '-o CheckHostIP=no -o StrictHostKeyChecking=no'
 
-      - name: Upload Apk to Release Repository
+      - name: Upload Apk to GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        uses: wlixcc/SFTP-Deploy-Action@v1.0
+        uses: AButler/upload-release-assets@v3.0
         with:
-          username: 'drone'
-          server: 'volla.tech'
-          port: 22
-          ssh_private_key: '${{ secrets.FDROID_DEPLOY_KEY }}'
-          local_path: releases/com.volla.vollaboard-signed.apk
-          remote_path: '/fdroid.volla.tech/builds/volla/vollaboard/'
-          args: '-o CheckHostIP=no -o StrictHostKeyChecking=no'
+          files: "releases/com.volla.vollaboard-signed.apk"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          release-id: ${{ needs.create-release.outputs.releaseId }}
