@@ -316,6 +316,16 @@ public class WhisperSplitEngine {
         if (encoderStateIdx < 0 || inputIdsIdx < 0 || logitsOutputIdx < 0 || decoderSeqLen <= 0) {
             Log.e(TAG, "FATAL: could not resolve required decoder tensors");
         }
+
+        int promptLen = buildPrompt().length;
+        if (decoderSeqLen > 0 && decoderSeqLen <= promptLen) {
+            Log.e(TAG, "FATAL: decoder input_ids window (seqLen=" + decoderSeqLen
+                    + ") leaves no room to generate beyond the " + promptLen
+                    + "-token prompt — this decoder will produce empty output for every utterance."
+                    + " It likely needs re-exporting with the simple 3-input contract"
+                    + " (encoder_hidden_states, input_ids, attention_mask) and a larger fixed window,"
+                    + " not a KV-cache decoder.");
+        }
     }
 
     // =========================================================================

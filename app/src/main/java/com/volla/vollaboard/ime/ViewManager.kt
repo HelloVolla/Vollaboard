@@ -90,8 +90,9 @@ class ViewManager(private val ime: Context) : AbstractComposeView(ime),
         val stateS = stateLD.observeAsState()
         val errorMessageS = errorMessageLD.observeAsState(R.string.mic_info_error)
         val recognizerNameS = recognizerNameLD.observeAsState(initial = "")
+        val config = LocalConfiguration.current
         val height =
-            (LocalConfiguration.current.screenHeightDp * when (LocalConfiguration.current.orientation) {
+            (config.screenHeightDp * when (config.orientation) {
                 Configuration.ORIENTATION_LANDSCAPE -> prefs.keyboardHeightLandscape.get()
                 else -> prefs.keyboardHeightPortrait.get()
             }).toInt().dp

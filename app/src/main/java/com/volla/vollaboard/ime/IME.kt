@@ -20,6 +20,7 @@ import android.os.IBinder
 import android.text.InputType
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
@@ -157,6 +158,26 @@ class IME : InputMethodService(), ModelManager.Listener {
     override fun onCreateInputView(): View {
         Log.d("IME", "@onCreateInputView. decorView: ${window?.window?.decorView}")
 
+        // viewManager is a single instance reused across calls (e.g. on
+        // rotation), but the framework doesn't always detach it from its
+        // previous parent before asking for it again — do that ourselves,
+        // or addView() throws "specified child already has a parent".
+        (viewManager.parent as? ViewGroup)?.removeView(viewManager)
+
+        // KNOWN LIMITATION: rotating the device while the keyboard is shown
+        // (e.g. while listening) leaves it unresponsive to touch afterward,
+        // even though this removeView() prevents the crash and Compose's
+        // own recomposition/state keeps working correctly across rotation
+        // (verified: Content() recomposes with the right orientation/height
+        // every time, and forcing Composition disposal via
+        // viewManager.disposeComposition() before returning made no
+        // difference). The break is below the Compose layer — most likely
+        // the IME window's input channel not being re-registered for touch
+        // routing after the framework tears down and rebuilds the window on
+        // a configuration change. Not fixable from this View/Compose code;
+        // would need addressing at the InputMethodService window-management
+        // level (e.g. forcing a requestHideSelf()/requestShowSelf() cycle on
+        // onConfigurationChanged, unverified).
         lifecycleOwner.attachToDecorView(
             window?.window?.decorView
         )
