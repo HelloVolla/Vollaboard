@@ -36,6 +36,16 @@ public class WhisperSplitEngine {
 
     public static final int SAMPLE_RATE = 16000;
 
+    // Intra-op thread count for the TFLite interpreters. Measured on an
+    // 8-core device, 2 threads matches 4: encoder 1392ms vs 1353ms (within
+    // noise) and decode was slightly faster (211 vs 229 ms/token, likely less
+    // thread-coordination overhead on the decoder's many small invocations).
+    // That means the workload is memory-bandwidth-bound, not compute-bound —
+    // so 2 leaves two cores free for the rest of the system at no cost in
+    // speed. Thread count does not affect transcription quality, only how the
+    // same work is spread across cores.
+    private static final int NUM_THREADS = 2;
+
     // Audio level handling. Whisper hallucinates non-speech tags ("[Musik]")
     // when fed quiet/noisy audio, so we gate out low-energy chunks and normalise
     // gain so real speech reaches the model at a usable level. Measured on
@@ -79,8 +89,12 @@ public class WhisperSplitEngine {
         vocab = new WhisperVocabJson();
         vocab.load(modelDir, langCode);
 
+        int cores = Runtime.getRuntime().availableProcessors();
+        int threads = Math.min(NUM_THREADS, cores);
+        Log.d(TAG, "Interpreter threads=" + threads + " (device cores=" + cores + ")");
+
         Interpreter.Options opts = new Interpreter.Options();
-        opts.setNumThreads(Math.min(4, Runtime.getRuntime().availableProcessors()));
+        opts.setNumThreads(threads);
         opts.setUseXNNPACK(true);
 
         melExtractor = loadInterpreter(new File(modelDir, "whisper_mel_extractor.tflite"), opts);
