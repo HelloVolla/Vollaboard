@@ -51,6 +51,9 @@ public class WhisperSplitEngine {
     private Interpreter decoder;
     private WhisperVocabJson vocab;
 
+    // Tokens produced by the most recent greedyDecode, for the timing log.
+    private int lastGeneratedTokens = 0;
+
     // Number of PCM samples the mel extractor consumes per call (read at init).
     private int melInputSamples = SAMPLE_RATE;
 
@@ -105,6 +108,7 @@ public class WhisperSplitEngine {
     public String transcribeBuffer(float[] samples) {
         if (!initialized) return "";
 
+        long tStart = System.currentTimeMillis();
         int validLen = Math.min(samples.length, melInputSamples);
 
         // Measure level on the valid (non-padding) portion.
@@ -126,13 +130,37 @@ public class WhisperSplitEngine {
         float[] padded = new float[melInputSamples];
         for (int i = 0; i < validLen; i++) padded[i] = samples[i] * gain;
 
+        // Pairs with the greedyDecode log below: tells us whether a chunk that
+        // exhausted the token budget was a full window or a short tail chunk.
+        Log.d(TAG, "transcribeBuffer: chunkSeconds=" + ((float) validLen / SAMPLE_RATE)
+                + " (window=" + ((float) melInputSamples / SAMPLE_RATE) + "s)");
+
+        // Stage timings. mel+encoder is a flat cost (the buffer is padded to the
+        // full window regardless of how much real speech it holds), while decode
+        // scales with tokens generated — so this shows which half any latency
+        // work has to target.
+        long t0 = System.currentTimeMillis();
         float[] mel = runMelExtractor(padded);
         if (mel == null) return "";
+        long t1 = System.currentTimeMillis();
 
         float[] encoderOut = runEncoder(mel);
         if (encoderOut == null) return "";
+        long t2 = System.currentTimeMillis();
 
-        return greedyDecode(encoderOut);
+        String text = greedyDecode(encoderOut);
+        long t3 = System.currentTimeMillis();
+
+        long decodeMs = t3 - t2;
+        String perToken = lastGeneratedTokens > 0
+                ? " (" + lastGeneratedTokens + " tokens, " + (decodeMs / lastGeneratedTokens) + "ms/token)"
+                : "";
+        Log.d(TAG, "timing: prep=" + (t0 - tStart) + "ms"
+                + " mel=" + (t1 - t0) + "ms"
+                + " encoder=" + (t2 - t1) + "ms"
+                + " decode=" + decodeMs + "ms" + perToken
+                + " TOTAL=" + (t3 - tStart) + "ms");
+        return text;
     }
 
     // =========================================================================
@@ -178,14 +206,17 @@ public class WhisperSplitEngine {
     private String greedyDecode(float[] encoderOut) {
         List<Integer> tokens = new ArrayList<>();
         for (int t : buildPrompt()) tokens.add(t);
+        int promptLen = tokens.size();
 
         StringBuilder result = new StringBuilder();
+        String stopReason = "ran out of window";
 
         // We can generate until the fixed window is full.
         while (tokens.size() < decoderSeqLen) {
             int next = decoderStep(encoderOut, tokens);
 
-            if (next < 0 || next == vocab.tokenEOT) break;
+            if (next < 0) { stopReason = "decoder step failed"; break; }
+            if (next == vocab.tokenEOT) { stopReason = "EOT"; break; }
 
             // Skip special tokens (>= EOT) from the visible text.
             if (next < vocab.tokenEOT) {
@@ -194,6 +225,15 @@ public class WhisperSplitEngine {
             }
             tokens.add(next);
         }
+
+        lastGeneratedTokens = tokens.size() - promptLen;
+
+        // "ran out of window" here means the chunk's audio was NOT fully
+        // transcribed — the decoder hit its fixed token budget mid-chunk and
+        // the rest of that audio is silently lost. Counts only, no text.
+        Log.d(TAG, "greedyDecode: generated " + (tokens.size() - promptLen)
+                + "/" + (decoderSeqLen - promptLen)
+                + " tokens, stopped because: " + stopReason);
 
         return cleanNonSpeech(decodeBpe(result.toString()).trim());
     }

@@ -108,6 +108,10 @@ class WhisperLocal(
         private var bufferPos = 0
         private var inSpeech = false
         private var silenceRun = 0          // consecutive silent samples while in speech
+        // Buffered samples that were actually speech (excludes the trailing
+        // silence appended during a pause). This — not bufferPos — decides
+        // whether there's enough real speech for a pause to end the utterance.
+        private var speechSamples = 0
         private var lastResult = ""
 
         // Text held across a mid-utterance buffer split, not yet committed.
@@ -132,15 +136,38 @@ class WhisperLocal(
                 val isSpeech = frameRms >= SPEECH_RMS
 
                 if (isSpeech) {
+                    if (!inSpeech) Log.d(TAG, "VAD: speech started (frameRms=$frameRms)")
                     inSpeech = true
                     silenceRun = 0
+                    val before = bufferPos
                     appendFrame(buffer, nread)
+                    speechSamples += bufferPos - before
                 } else if (inSpeech) {
-                    // Keep trailing silence so word endings aren't clipped, but use
-                    // it to detect the end-of-utterance pause.
-                    appendFrame(buffer, nread)
+                    // Keep a SHORT tail of silence so word endings aren't clipped —
+                    // but stop there, and keep counting the rest only for pause
+                    // detection. Appending the whole pause dilutes the buffer's
+                    // average level until the engine's silence gate throws real
+                    // speech away: measured, a 0.7s utterance followed by 2.2s of
+                    // appended silence came to rms 0.0154 against a 0.015 gate, and
+                    // the end of the sentence was discarded without ever reaching
+                    // the model. It also stops a long pause from inflating the
+                    // buffer to the window size and triggering a pointless split.
+                    if (silenceRun < TRAILING_SILENCE_SAMPLES) appendFrame(buffer, nread)
                     silenceRun += nread
-                    if (silenceRun >= PAUSE_SAMPLES) flush()
+
+                    // A pause only ends the utterance once enough actual speech
+                    // has accumulated. Natural mid-sentence gaps are frequently
+                    // longer than PAUSE_SAMPLES, and committing there chops a
+                    // sentence into sub-second fragments that the model cannot
+                    // transcribe (it hallucinates on them). A much longer silence
+                    // ends the utterance regardless, so a genuinely short one-word
+                    // utterance still gets committed.
+                    val enoughSpeech = speechSamples >= MIN_UTTERANCE_SAMPLES
+                    if (enoughSpeech && silenceRun >= PAUSE_SAMPLES) {
+                        flush("pause")
+                    } else if (silenceRun >= LONG_PAUSE_SAMPLES) {
+                        flush("long-pause")
+                    }
                 }
                 // Otherwise: leading silence before any speech — ignore it.
 
@@ -177,16 +204,31 @@ class WhisperLocal(
          * capture thread — this is a genuine boundary — but the transcript
          * itself isn't ready until the executor job runs.
          */
-        private fun flush() {
+        private fun flush(reason: String) {
             val len = bufferPos
+            val speech = speechSamples
+            Log.d(
+                TAG, "flush($reason): speechSeconds=${speech.toSeconds()}" +
+                    " bufferSeconds=${len.toSeconds()} silenceSeconds=${silenceRun.toSeconds()}"
+            )
             resetState()
-            val chunk = if (len < MIN_SPEECH_SAMPLES) null else buffer.copyOf(len)
+            // Judge "too short to be a word" on real speech, not on a buffer
+            // that may be mostly trailing silence.
+            val chunk = if (speech < MIN_SPEECH_SAMPLES) null else buffer.copyOf(len)
+            if (chunk == null) Log.d(TAG, "flush($reason): discarded, too little speech")
 
+            val submittedAt = System.currentTimeMillis()
             executor.execute {
+                val startedAt = System.currentTimeMillis()
                 val text = if (chunk != null) engine.transcribeBuffer(chunk) else ""
                 val combined = stitch(pendingText, text)
                 pendingText = ""
                 if (combined.isNotEmpty()) readyResult = combined
+                Log.d(
+                    TAG, "flush($reason) job done: queueWait=${startedAt - submittedAt}ms" +
+                        " work=${System.currentTimeMillis() - startedAt}ms" +
+                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
+                )
             }
         }
 
@@ -201,16 +243,30 @@ class WhisperLocal(
          * one arrives.
          */
         private fun splitFlush() {
+            Log.d(
+                TAG, "splitFlush: window full (${maxSamples.toSeconds()}s) with no pause —" +
+                    " holding text to stitch onto the next window"
+            )
             val chunk = buffer.copyOf(bufferPos)
             val tail = chunk.copyOfRange(chunk.size - OVERLAP_SAMPLES, chunk.size)
             tail.copyInto(buffer)
             bufferPos = OVERLAP_SAMPLES
+            // The carried-over overlap is prior speech, so it counts toward the
+            // next window's speech total.
+            speechSamples = OVERLAP_SAMPLES
             silenceRun = 0
             // inSpeech stays true — we're mid-utterance, not at a real pause.
 
+            val submittedAt = System.currentTimeMillis()
             executor.execute {
+                val startedAt = System.currentTimeMillis()
                 val text = engine.transcribeBuffer(chunk)
                 if (text.isNotEmpty()) pendingText = stitch(pendingText, text)
+                Log.d(
+                    TAG, "splitFlush job done: queueWait=${startedAt - submittedAt}ms" +
+                        " work=${System.currentTimeMillis() - startedAt}ms" +
+                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
+                )
             }
         }
 
@@ -248,7 +304,11 @@ class WhisperLocal(
             bufferPos = 0
             inSpeech = false
             silenceRun = 0
+            speechSamples = 0
         }
+
+        /** Sample count as seconds, for logging. */
+        private fun Int.toSeconds(): Float = this.toFloat() / WhisperSplitEngine.SAMPLE_RATE
 
         override fun getResult(): String {
             val r = lastResult
@@ -308,8 +368,25 @@ class WhisperLocal(
         companion object {
             // Ignore utterances shorter than 0.25 s (stray clicks/noise).
             private const val MIN_SPEECH_SAMPLES = WhisperSplitEngine.SAMPLE_RATE / 4
-            // ~0.4 s of silence ends an utterance and triggers transcription.
-            private const val PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 2 / 5
+            // ~0.8 s of silence ends an utterance, but only once
+            // MIN_UTTERANCE_SAMPLES of real speech has accumulated. Was 0.4 s,
+            // which fired on ordinary mid-sentence gaps and chopped one spoken
+            // sentence into seven fragments — four of them 0.6 s, which the
+            // model transcribes as gibberish. See the measurements in
+            // WHISPER_INTEGRATION_JOURNEY.md.
+            private const val PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 4 / 5
+            // A pause only ends an utterance once ~1.2 s of actual speech is
+            // buffered; below that the model has too little context and
+            // hallucinates. Measured: chunks >= 1.0 s transcribed sensibly,
+            // 0.6 s chunks produced garbage.
+            private const val MIN_UTTERANCE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 6 / 5
+            // ...but a long enough silence ends the utterance regardless of how
+            // little speech there is, so a genuine one-word reply still commits.
+            private const val LONG_PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 2
+            // How much trailing silence actually gets buffered (the rest is only
+            // counted). Enough to avoid clipping a word ending, little enough not
+            // to drag the buffer's average level below the engine's silence gate.
+            private const val TRAILING_SILENCE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 3 / 10
             // Per-frame RMS above this counts as speech (below ≈ noise/silence).
             // Device measurements: background noise ≈ 0.011, speech ≈ 0.025+.
             private const val SPEECH_RMS = 0.018f
