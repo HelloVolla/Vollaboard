@@ -72,8 +72,14 @@ public class WhisperSplitEngine {
     private static final String SIG_PREFILL = "prefill";
     private static final String SIG_STEP    = "step";
 
-    // Cap on prompt + generated tokens per chunk, as in inference.py.
-    private static final int MAX_TOKENS = 32;
+    // Cap on prompt + generated tokens per chunk. Hitting this truncates the
+    // chunk mid-sentence and silently drops the rest of its audio, so it wants
+    // headroom: measured chunks have reached 18, and this was 32 only because
+    // the pre-KV-cache decoder's input_ids window was baked at that size. The
+    // 'step' signature takes a dynamic length, so the ceiling is now ours to
+    // choose, and at ~28ms per generated token the headroom is nearly free.
+    // Whisper's decoder supports up to 448 positions, so 128 is well inside.
+    private static final int MAX_TOKENS = 128;
 
     // Decoder dimensions, read from the prefill signature at init.
     private int kvLayers  = 0;

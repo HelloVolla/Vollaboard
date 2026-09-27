@@ -78,9 +78,10 @@ class WhisperLocal(
      * whatever acceptWaveForm's "true" return causes it to fetch, and that
      * type is irreversible, so we can't fix up text after the fact the way a
      * redrawable streaming display could. Instead, consecutive windows overlap
-     * by [OVERLAP_SECONDS] of raw audio (2s on the 5s window, so a 3s stride)
-     * and each chunk's text is merged onto the held text with aggregate(),
-     * only emitting the combined result once a real pause ends the utterance.
+     * by [OVERLAP_SECONDS] of raw audio — capped at half the window, so 2.5s
+     * carried and a 2.5s stride on the 5s model — and each chunk's text is
+     * merged onto the held text with aggregate(), only emitting the combined
+     * result once a real pause ends the utterance.
      */
     private class WhisperRecognizer(
         private val engine: WhisperSplitEngine,
@@ -411,14 +412,18 @@ class WhisperLocal(
             // Per-frame RMS above this counts as speech (below ≈ noise/silence).
             // Device measurements: background noise ≈ 0.011, speech ≈ 0.025+.
             private const val SPEECH_RMS = 0.018f
-            // Trailing audio carried across a mid-utterance window split, as in
-            // inference.py: 2 s on a 5 s window → 3 s stride. Long enough that
+            // Trailing audio carried across a mid-utterance window split, so
             // the boundary words aggregate() drops from one window are
-            // transcribed whole in the other (~5 words of shared audio), while
-            // every extra second of overlap shortens the stride and so adds a
-            // whole extra inference per utterance — measured at ~1.4 s flat
-            // plus ~215 ms/token each, which is the dominant latency cost.
-            private const val OVERLAP_SECONDS = 2
+            // transcribed whole in the other. Requested value is clamped to
+            // half the window (see overlapSamples), so on the 5 s model this
+            // is 2.5 s carried → 2.5 s stride.
+            //
+            // This was briefly lowered to 2 s when an extra chunk cost ~4.8 s
+            // and chunks were backing up 2-3 s behind each other. The KV-cache
+            // decoder cut a chunk to ~1.9 s and removed the backlog entirely,
+            // so the extra chunk a longer overlap costs is now affordable and
+            // is worth spending on more reliable boundary merging.
+            private const val OVERLAP_SECONDS = 3
             // Safety bound for getFinalResult()'s drain wait. A larger model
             // window means more mel frames/encoder tokens per inference call,
             // so this is generous rather than tuned tightly to the 1s model's
