@@ -18,8 +18,8 @@ android {
         applicationId "com.volla.vollaboard"
         minSdkVersion 23
         targetSdkVersion 35
-        versionCode 402022
-        versionName "v4.2.2-dev.2"
+        versionCode 402023
+        versionName "v4.2.3"
         ndkVersion "r25c"
         ndk {
         abiFilters "arm64-v8a"
