@@ -19,22 +19,34 @@ import java.util.Map;
  * Whisper inference engine for the split-model TFLite format:
  *   whisper_mel_extractor.tflite — raw audio → log-mel spectrogram
  *   whisper_encoder.tflite       — log-mel → encoder hidden states
- *   whisper_decoder.tflite       — (encoder states + token window) → logits
+ *   whisper_decoder.tflite       — KV-cached decoder with two signatures
  *
- * The decoder is a fixed-length, non-cached model:
- *   inputs : encoder_hidden_states [1, 1500, 384]
- *            input_ids             [1, SEQ]   (SEQ is fixed, e.g. 32)
- *            attention_mask        [1, SEQ]
- *   output : logits               [1, SEQ, vocab]
+ * The decoder (extract_decoder_cache.py) exposes:
+ *   prefill: input_ids [1, 4] + encoder_hidden_states [1, 1500, 384]
+ *            → logits [1, vocab], self_k/self_v [4, 1, 6, 4, 64],
+ *              cross_k/cross_v [4, 1, 6, 1500, 64]
+ *   step:    input_ids [1, 1] + encoder_hidden_states + self_k/self_v
+ *            [4, 1, 6, T, 64] + cross_k/cross_v
+ *            → logits [1, vocab], self_k/self_v [4, 1, 6, T+1, 64]
  *
- * Decoding re-feeds the whole token sequence (prompt + generated so far) every
- * step, right-padded to SEQ, with the attention mask marking valid positions.
- * The next token is the argmax of the logits row at the last valid position.
+ * Decoding runs prefill once on the prompt, then feeds only the latest token
+ * to step, carrying the self K/V caches forward (cross K/V stay fixed per
+ * chunk). The next token is the argmax of the returned logits.
  */
 public class WhisperSplitEngine {
     private static final String TAG = "WhisperSplitEngine";
 
     public static final int SAMPLE_RATE = 16000;
+
+    // Intra-op thread count for the TFLite interpreters. Measured on an
+    // 8-core device, 2 threads matches 4: encoder 1392ms vs 1353ms (within
+    // noise) and decode was slightly faster (211 vs 229 ms/token, likely less
+    // thread-coordination overhead on the decoder's many small invocations).
+    // That means the workload is memory-bandwidth-bound, not compute-bound —
+    // so 2 leaves two cores free for the rest of the system at no cost in
+    // speed. Thread count does not affect transcription quality, only how the
+    // same work is spread across cores.
+    private static final int NUM_THREADS = 2;
 
     // Audio level handling. Whisper hallucinates non-speech tags ("[Musik]")
     // when fed quiet/noisy audio, so we gate out low-energy chunks and normalise
@@ -51,17 +63,33 @@ public class WhisperSplitEngine {
     private Interpreter decoder;
     private WhisperVocabJson vocab;
 
+    // Tokens produced by the most recent greedyDecode, for the timing log.
+    private int lastGeneratedTokens = 0;
+
     // Number of PCM samples the mel extractor consumes per call (read at init).
     private int melInputSamples = SAMPLE_RATE;
 
-    // Decoder input/output indices, discovered by tensor name at init.
-    private int encoderStateIdx  = -1;
-    private int inputIdsIdx       = -1;
-    private int attentionMaskIdx  = -1;
-    private int logitsOutputIdx   = -1;
+    private static final String SIG_PREFILL = "prefill";
+    private static final String SIG_STEP    = "step";
 
-    // Fixed decoder sequence length (input_ids dimension, e.g. 32).
-    private int decoderSeqLen = 0;
+    // Cap on prompt + generated tokens per chunk. Hitting this truncates the
+    // chunk mid-sentence and silently drops the rest of its audio, so it wants
+    // headroom: measured chunks have reached 18, and this was 32 only because
+    // the pre-KV-cache decoder's input_ids window was baked at that size. The
+    // 'step' signature takes a dynamic length, so the ceiling is now ours to
+    // choose, and at ~28ms per generated token the headroom is nearly free.
+    // Whisper's decoder supports up to 448 positions, so 128 is well inside.
+    private static final int MAX_TOKENS = 128;
+
+    // Decoder dimensions, read from the prefill signature at init.
+    private int kvLayers  = 0;
+    private int kvHeads   = 0;
+    private int kvHeadDim = 0;
+    private int vocabSize = 0;
+
+    // Cross-attention K/V from prefill, reused by every step of the chunk.
+    private ByteBuffer crossK;
+    private ByteBuffer crossV;
 
     private boolean initialized = false;
 
@@ -76,8 +104,12 @@ public class WhisperSplitEngine {
         vocab = new WhisperVocabJson();
         vocab.load(modelDir, langCode);
 
+        int cores = Runtime.getRuntime().availableProcessors();
+        int threads = Math.min(NUM_THREADS, cores);
+        Log.d(TAG, "Interpreter threads=" + threads + " (device cores=" + cores + ")");
+
         Interpreter.Options opts = new Interpreter.Options();
-        opts.setNumThreads(Math.min(4, Runtime.getRuntime().availableProcessors()));
+        opts.setNumThreads(threads);
         opts.setUseXNNPACK(true);
 
         melExtractor = loadInterpreter(new File(modelDir, "whisper_mel_extractor.tflite"), opts);
@@ -95,6 +127,8 @@ public class WhisperSplitEngine {
         if (melExtractor != null) { melExtractor.close(); melExtractor = null; }
         if (encoder      != null) { encoder.close();      encoder      = null; }
         if (decoder      != null) { decoder.close();      decoder      = null; }
+        crossK = null;
+        crossV = null;
         initialized = false;
     }
 
@@ -105,6 +139,7 @@ public class WhisperSplitEngine {
     public String transcribeBuffer(float[] samples) {
         if (!initialized) return "";
 
+        long tStart = System.currentTimeMillis();
         int validLen = Math.min(samples.length, melInputSamples);
 
         // Measure level on the valid (non-padding) portion.
@@ -126,13 +161,37 @@ public class WhisperSplitEngine {
         float[] padded = new float[melInputSamples];
         for (int i = 0; i < validLen; i++) padded[i] = samples[i] * gain;
 
+        // Pairs with the greedyDecode log below: tells us whether a chunk that
+        // exhausted the token budget was a full window or a short tail chunk.
+        Log.d(TAG, "transcribeBuffer: chunkSeconds=" + ((float) validLen / SAMPLE_RATE)
+                + " (window=" + ((float) melInputSamples / SAMPLE_RATE) + "s)");
+
+        // Stage timings. mel+encoder is a flat cost (the buffer is padded to the
+        // full window regardless of how much real speech it holds), while decode
+        // scales with tokens generated — so this shows which half any latency
+        // work has to target.
+        long t0 = System.currentTimeMillis();
         float[] mel = runMelExtractor(padded);
         if (mel == null) return "";
+        long t1 = System.currentTimeMillis();
 
         float[] encoderOut = runEncoder(mel);
         if (encoderOut == null) return "";
+        long t2 = System.currentTimeMillis();
 
-        return greedyDecode(encoderOut);
+        String text = greedyDecode(encoderOut);
+        long t3 = System.currentTimeMillis();
+
+        long decodeMs = t3 - t2;
+        String perToken = lastGeneratedTokens > 0
+                ? " (" + lastGeneratedTokens + " tokens, " + (decodeMs / lastGeneratedTokens) + "ms/token)"
+                : "";
+        Log.d(TAG, "timing: prep=" + (t0 - tStart) + "ms"
+                + " mel=" + (t1 - t0) + "ms"
+                + " encoder=" + (t2 - t1) + "ms"
+                + " decode=" + decodeMs + "ms" + perToken
+                + " TOTAL=" + (t3 - tStart) + "ms");
+        return text;
     }
 
     // =========================================================================
@@ -172,28 +231,88 @@ public class WhisperSplitEngine {
     }
 
     // =========================================================================
-    // Greedy decoder (fixed-length, re-feed each step)
+    // Greedy decoder (KV-cached: prefill once, then one token per step)
     // =========================================================================
 
     private String greedyDecode(float[] encoderOut) {
+        int[] prompt = buildPrompt();
         List<Integer> tokens = new ArrayList<>();
-        for (int t : buildPrompt()) tokens.add(t);
+        for (int t : prompt) tokens.add(t);
 
+        ByteBuffer encBuf = floatArrayToBuffer(encoderOut);
+        float[][] logits = new float[1][vocabSize];
+        String stopReason = "token budget exhausted";
+
+        try {
+            // prefill: the whole prompt → first logits, the prompt's self K/V
+            // and the cross K/V, which stay fixed for the rest of the chunk.
+            float[][][][][] selfK = newSelfKv(prompt.length);
+            float[][][][][] selfV = newSelfKv(prompt.length);
+
+            Map<String, Object> inputs = new HashMap<>();
+            inputs.put("input_ids", new int[][]{prompt});
+            inputs.put("encoder_hidden_states", encBuf);
+
+            Map<String, Object> outputs = new HashMap<>();
+            outputs.put("logits",  logits);
+            outputs.put("self_k",  selfK);
+            outputs.put("self_v",  selfV);
+            outputs.put("cross_k", rewound(crossK));
+            outputs.put("cross_v", rewound(crossV));
+
+            decoder.runSignature(inputs, outputs, SIG_PREFILL);
+            tokens.add(argmax(logits[0]));
+
+            // step: feed the last token plus the caches; the self K/V come
+            // back one position longer.
+            while (tokens.get(tokens.size() - 1) != vocab.tokenEOT
+                    && tokens.size() < MAX_TOKENS) {
+                int cacheLen = selfK[0][0][0].length;
+                float[][][][][] nextK = newSelfKv(cacheLen + 1);
+                float[][][][][] nextV = newSelfKv(cacheLen + 1);
+
+                inputs.clear();
+                inputs.put("input_ids", new int[][]{{tokens.get(tokens.size() - 1)}});
+                inputs.put("encoder_hidden_states", rewound(encBuf));
+                inputs.put("self_k",  selfK);
+                inputs.put("self_v",  selfV);
+                inputs.put("cross_k", rewound(crossK));
+                inputs.put("cross_v", rewound(crossV));
+
+                outputs.clear();
+                outputs.put("logits", logits);
+                outputs.put("self_k", nextK);
+                outputs.put("self_v", nextV);
+
+                decoder.runSignature(inputs, outputs, SIG_STEP);
+                selfK = nextK;
+                selfV = nextV;
+                tokens.add(argmax(logits[0]));
+            }
+            if (tokens.get(tokens.size() - 1) == vocab.tokenEOT) stopReason = "EOT";
+        } catch (Exception e) {
+            Log.e(TAG, "decoder failed (tokens=" + tokens.size() + ")", e);
+            stopReason = "decoder failed";
+        }
+
+        // Skip special tokens (>= EOT) from the visible text.
         StringBuilder result = new StringBuilder();
-
-        // We can generate until the fixed window is full.
-        while (tokens.size() < decoderSeqLen) {
-            int next = decoderStep(encoderOut, tokens);
-
-            if (next < 0 || next == vocab.tokenEOT) break;
-
-            // Skip special tokens (>= EOT) from the visible text.
-            if (next < vocab.tokenEOT) {
-                String word = vocab.tokenToWord.get(next);
+        for (int i = prompt.length; i < tokens.size(); i++) {
+            int t = tokens.get(i);
+            if (t < vocab.tokenEOT) {
+                String word = vocab.tokenToWord.get(t);
                 if (word != null) result.append(word);
             }
-            tokens.add(next);
         }
+
+        lastGeneratedTokens = tokens.size() - prompt.length;
+
+        // "token budget exhausted" here means the chunk's audio was NOT fully
+        // transcribed — the rest of that audio is silently lost. Counts only,
+        // no text.
+        Log.d(TAG, "greedyDecode: generated " + lastGeneratedTokens
+                + "/" + (MAX_TOKENS - prompt.length)
+                + " tokens, stopped because: " + stopReason);
 
         return cleanNonSpeech(decodeBpe(result.toString()).trim());
     }
@@ -224,60 +343,25 @@ public class WhisperSplitEngine {
     }
 
     /**
-     * One decode step.  Feeds the whole token sequence (right-padded to the
-     * decoder's fixed SEQ length) plus the attention mask and encoder states,
-     * then returns the argmax token at the last valid position.
+     * Self-attention K/V cache holding [len] positions. A Java array rather
+     * than a ByteBuffer: the sequence dimension is dynamic, and runSignature
+     * only resizes an input to match when it can read the shape off an array.
      */
-    private int decoderStep(float[] encoderOut, List<Integer> tokens) {
-        int n = tokens.size();                 // valid tokens (<= decoderSeqLen)
-        int inputCount = decoder.getInputTensorCount();
+    private float[][][][][] newSelfKv(int len) {
+        return new float[kvLayers][1][kvHeads][len][kvHeadDim];
+    }
 
-        // input_ids (int32, right-padded with 0 — matches the reference pipeline)
-        ByteBuffer idsBuf = ByteBuffer.allocateDirect(decoderSeqLen * Integer.BYTES)
-                .order(ByteOrder.nativeOrder());
-        for (int i = 0; i < decoderSeqLen; i++) {
-            idsBuf.putInt(i < n ? tokens.get(i) : 0);
+    private static int argmax(float[] row) {
+        int best = 0;
+        for (int v = 1; v < row.length; v++) {
+            if (row[v] > row[best]) best = v;
         }
-        idsBuf.rewind();
+        return best;
+    }
 
-        // attention_mask (int32, 1 for valid positions, 0 for padding)
-        ByteBuffer maskBuf = ByteBuffer.allocateDirect(decoderSeqLen * Integer.BYTES)
-                .order(ByteOrder.nativeOrder());
-        for (int i = 0; i < decoderSeqLen; i++) {
-            maskBuf.putInt(i < n ? 1 : 0);
-        }
-        maskBuf.rewind();
-
-        Object[] inputs = new Object[inputCount];
-        inputs[encoderStateIdx] = floatArrayToBuffer(encoderOut);
-        inputs[inputIdsIdx]     = idsBuf;
-        if (attentionMaskIdx >= 0) inputs[attentionMaskIdx] = maskBuf;
-
-        int vocabSize = lastDim(decoder.getOutputTensor(logitsOutputIdx).shape());
-        ByteBuffer logitsBuf = ByteBuffer.allocateDirect(
-                elemCount(decoder.getOutputTensor(logitsOutputIdx).shape()) * Float.BYTES)
-                .order(ByteOrder.nativeOrder());
-        Map<Integer, Object> outputs = new HashMap<>();
-        outputs.put(logitsOutputIdx, logitsBuf);
-
-        try {
-            decoder.runForMultipleInputsOutputs(inputs, outputs);
-        } catch (Exception e) {
-            Log.e(TAG, "decoder step failed (n=" + n + ")", e);
-            return -1;
-        }
-
-        // Next-token logits are the row at the last valid position (n - 1).
-        logitsBuf.rewind();
-        logitsBuf.position((n - 1) * vocabSize * Float.BYTES);
-
-        int bestToken  = -1;
-        float bestScore = Float.NEGATIVE_INFINITY;
-        for (int v = 0; v < vocabSize; v++) {
-            float s = logitsBuf.getFloat();
-            if (s > bestScore) { bestScore = s; bestToken = v; }
-        }
-        return bestToken;
+    private static ByteBuffer rewound(ByteBuffer buf) {
+        buf.rewind();
+        return buf;
     }
 
     // =========================================================================
@@ -285,46 +369,36 @@ public class WhisperSplitEngine {
     // =========================================================================
 
     private void detectDecoderLayout() {
-        int inputCount = decoder.getInputTensorCount();
-        for (int i = 0; i < inputCount; i++) {
-            String name = decoder.getInputTensor(i).name();
-            if (name.contains("encoder_hidden_states")) {
-                encoderStateIdx = i;
-            } else if (name.contains("input_ids")) {
-                inputIdsIdx   = i;
-                decoderSeqLen = lastDim(decoder.getInputTensor(i).shape());
-            } else if (name.contains("attention_mask")) {
-                attentionMaskIdx = i;
-            }
+        List<String> sigs = java.util.Arrays.asList(decoder.getSignatureKeys());
+        if (!sigs.contains(SIG_PREFILL) || !sigs.contains(SIG_STEP)) {
+            throw new IllegalStateException("whisper_decoder.tflite has signatures " + sigs
+                    + "; expected the KV-cache decoder with '" + SIG_PREFILL
+                    + "' and '" + SIG_STEP + "' (see extract_decoder_cache.py)");
         }
 
-        int outputCount = decoder.getOutputTensorCount();
-        for (int o = 0; o < outputCount; o++) {
-            int[] shape = decoder.getOutputTensor(o).shape();
-            if (shape.length >= 2 && shape[shape.length - 1] > 50000) {
-                logitsOutputIdx = o;
-                break;
-            }
-        }
+        // cross_k: [layers, 1, heads, encLen, headDim]
+        int[] cross = decoder.getOutputTensorFromSignature("cross_k", SIG_PREFILL).shape();
+        kvLayers  = cross[0];
+        kvHeads   = cross[2];
+        kvHeadDim = cross[4];
+        vocabSize = lastDim(decoder.getOutputTensorFromSignature("logits", SIG_PREFILL).shape());
 
-        Log.d(TAG, "Decoder layout: encoderStateIdx=" + encoderStateIdx
-                + " inputIdsIdx=" + inputIdsIdx
-                + " maskIdx=" + attentionMaskIdx
-                + " logitsOut=" + logitsOutputIdx
-                + " seqLen=" + decoderSeqLen);
+        // Allocated once and reused: ~9 MB each for whisper-tiny.
+        int crossBytes = elemCount(cross) * Float.BYTES;
+        crossK = ByteBuffer.allocateDirect(crossBytes).order(ByteOrder.nativeOrder());
+        crossV = ByteBuffer.allocateDirect(crossBytes).order(ByteOrder.nativeOrder());
 
-        if (encoderStateIdx < 0 || inputIdsIdx < 0 || logitsOutputIdx < 0 || decoderSeqLen <= 0) {
-            Log.e(TAG, "FATAL: could not resolve required decoder tensors");
-        }
-
+        int prefillLen = lastDim(decoder.getInputTensorFromSignature("input_ids", SIG_PREFILL).shape());
         int promptLen = buildPrompt().length;
-        if (decoderSeqLen > 0 && decoderSeqLen <= promptLen) {
-            Log.e(TAG, "FATAL: decoder input_ids window (seqLen=" + decoderSeqLen
-                    + ") leaves no room to generate beyond the " + promptLen
-                    + "-token prompt — this decoder will produce empty output for every utterance."
-                    + " It likely needs re-exporting with the simple 3-input contract"
-                    + " (encoder_hidden_states, input_ids, attention_mask) and a larger fixed window,"
-                    + " not a KV-cache decoder.");
+
+        Log.d(TAG, "Decoder layout: layers=" + kvLayers + " heads=" + kvHeads
+                + " headDim=" + kvHeadDim + " encLen=" + cross[3]
+                + " vocab=" + vocabSize + " prefillLen=" + prefillLen);
+
+        if (prefillLen != promptLen) {
+            throw new IllegalStateException("decoder prefill takes " + prefillLen
+                    + " prompt tokens but the prompt has " + promptLen
+                    + " (missing language token?)");
         }
     }
 

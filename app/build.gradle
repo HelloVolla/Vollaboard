@@ -18,7 +18,7 @@ android {
         applicationId "com.volla.vollaboard"
         minSdkVersion 23
         targetSdkVersion 35
-        versionCode 402021
+        versionCode 402022
         versionName "v4.2.2-dev.2"
         ndkVersion "r25c"
         ndk {

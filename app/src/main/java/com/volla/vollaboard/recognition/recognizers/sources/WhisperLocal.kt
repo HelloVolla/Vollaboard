@@ -77,12 +77,11 @@ class WhisperLocal(
      * immediately: MySpeechService types
      * whatever acceptWaveForm's "true" return causes it to fetch, and that
      * type is irreversible, so we can't fix up text after the fact the way a
-     * redrawable streaming display could. Instead we carry the trailing ~0.3s
-     * of raw audio into the next window (so a word split by the cut appears
-     * whole in at least one window) and stitch each chunk's text onto the
-     * held text by matching the overlapping words, only emitting the combined
-     * result once a real pause ends the utterance. This is the standard
-     * overlap-and-stitch technique used by streaming Whisper implementations.
+     * redrawable streaming display could. Instead, consecutive windows overlap
+     * by [OVERLAP_SECONDS] of raw audio — capped at half the window, so 2.5s
+     * carried and a 2.5s stride on the 5s model — and each chunk's text is
+     * merged onto the held text with aggregate(), only emitting the combined
+     * result once a real pause ends the utterance.
      */
     private class WhisperRecognizer(
         private val engine: WhisperSplitEngine,
@@ -92,7 +91,7 @@ class WhisperLocal(
         override val sampleRate: Float = WhisperSplitEngine.SAMPLE_RATE.toFloat()
 
         // Runs every engine.transcribeBuffer() call, off the capture thread.
-        // Single-threaded so chunks are transcribed and stitched in order.
+        // Single-threaded so chunks are transcribed and merged in order.
         private val executor = Executors.newSingleThreadExecutor()
 
         // The model's actual window size, read from the loaded .tflite file
@@ -105,9 +104,19 @@ class WhisperLocal(
         // Speech is accumulated here (float [-1, 1]); capped at the model's window.
         // Owned by the capture thread only.
         private val buffer: FloatArray by lazy { FloatArray(maxSamples) }
+
+        // Audio carried from one window into the next on a split. Capped at
+        // half the window so a smaller model (e.g. 1s) still advances.
+        private val overlapSamples: Int by lazy {
+            minOf(OVERLAP_SECONDS * WhisperSplitEngine.SAMPLE_RATE, maxSamples / 2)
+        }
         private var bufferPos = 0
         private var inSpeech = false
         private var silenceRun = 0          // consecutive silent samples while in speech
+        // Buffered samples that were actually speech (excludes the trailing
+        // silence appended during a pause). This — not bufferPos — decides
+        // whether there's enough real speech for a pause to end the utterance.
+        private var speechSamples = 0
         private var lastResult = ""
 
         // Text held across a mid-utterance buffer split, not yet committed.
@@ -132,15 +141,38 @@ class WhisperLocal(
                 val isSpeech = frameRms >= SPEECH_RMS
 
                 if (isSpeech) {
+                    if (!inSpeech) Log.d(TAG, "VAD: speech started (frameRms=$frameRms)")
                     inSpeech = true
                     silenceRun = 0
+                    val before = bufferPos
                     appendFrame(buffer, nread)
+                    speechSamples += bufferPos - before
                 } else if (inSpeech) {
-                    // Keep trailing silence so word endings aren't clipped, but use
-                    // it to detect the end-of-utterance pause.
-                    appendFrame(buffer, nread)
+                    // Keep a SHORT tail of silence so word endings aren't clipped —
+                    // but stop there, and keep counting the rest only for pause
+                    // detection. Appending the whole pause dilutes the buffer's
+                    // average level until the engine's silence gate throws real
+                    // speech away: measured, a 0.7s utterance followed by 2.2s of
+                    // appended silence came to rms 0.0154 against a 0.015 gate, and
+                    // the end of the sentence was discarded without ever reaching
+                    // the model. It also stops a long pause from inflating the
+                    // buffer to the window size and triggering a pointless split.
+                    if (silenceRun < TRAILING_SILENCE_SAMPLES) appendFrame(buffer, nread)
                     silenceRun += nread
-                    if (silenceRun >= PAUSE_SAMPLES) flush()
+
+                    // A pause only ends the utterance once enough actual speech
+                    // has accumulated. Natural mid-sentence gaps are frequently
+                    // longer than PAUSE_SAMPLES, and committing there chops a
+                    // sentence into sub-second fragments that the model cannot
+                    // transcribe (it hallucinates on them). A much longer silence
+                    // ends the utterance regardless, so a genuinely short one-word
+                    // utterance still gets committed.
+                    val enoughSpeech = speechSamples >= MIN_UTTERANCE_SAMPLES
+                    if (enoughSpeech && silenceRun >= PAUSE_SAMPLES) {
+                        flush("pause")
+                    } else if (silenceRun >= LONG_PAUSE_SAMPLES) {
+                        flush("long-pause")
+                    }
                 }
                 // Otherwise: leading silence before any speech — ignore it.
 
@@ -171,22 +203,37 @@ class WhisperLocal(
 
         /**
          * A real pause ended the utterance: snapshot whatever's left and
-         * hand it to the background executor, which transcribes it, stitches
+         * hand it to the background executor, which transcribes it, merges
          * it onto any text held from earlier splits, and makes the combined
          * result available via [readyResult]. Full VAD reset here on the
          * capture thread — this is a genuine boundary — but the transcript
          * itself isn't ready until the executor job runs.
          */
-        private fun flush() {
+        private fun flush(reason: String) {
             val len = bufferPos
+            val speech = speechSamples
+            Log.d(
+                TAG, "flush($reason): speechSeconds=${speech.toSeconds()}" +
+                    " bufferSeconds=${len.toSeconds()} silenceSeconds=${silenceRun.toSeconds()}"
+            )
             resetState()
-            val chunk = if (len < MIN_SPEECH_SAMPLES) null else buffer.copyOf(len)
+            // Judge "too short to be a word" on real speech, not on a buffer
+            // that may be mostly trailing silence.
+            val chunk = if (speech < MIN_SPEECH_SAMPLES) null else buffer.copyOf(len)
+            if (chunk == null) Log.d(TAG, "flush($reason): discarded, too little speech")
 
+            val submittedAt = System.currentTimeMillis()
             executor.execute {
+                val startedAt = System.currentTimeMillis()
                 val text = if (chunk != null) engine.transcribeBuffer(chunk) else ""
-                val combined = stitch(pendingText, text)
+                val combined = aggregate(pendingText, text)
                 pendingText = ""
                 if (combined.isNotEmpty()) readyResult = combined
+                Log.d(
+                    TAG, "flush($reason) job done: queueWait=${startedAt - submittedAt}ms" +
+                        " work=${System.currentTimeMillis() - startedAt}ms" +
+                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
+                )
             }
         }
 
@@ -195,60 +242,91 @@ class WhisperLocal(
          * yet): hand this window to the background executor and hold its
          * text rather than committing it, since MySpeechService types a
          * committed result immediately and it can't be revised afterwards.
-         * Carry the trailing overlap of raw audio into the next window so a
-         * word cut by this split still appears whole in (at least) one
-         * window, and stitch the two chunks' text together once the next
-         * one arrives.
+         * Carry the trailing overlap of raw audio into the next window so the
+         * words at this split sit well inside the next window too, and
+         * aggregate the two chunks' text once the next one arrives.
          */
         private fun splitFlush() {
+            Log.d(
+                TAG, "splitFlush: window full (${maxSamples.toSeconds()}s) with no pause —" +
+                    " holding text to aggregate with the next window"
+            )
             val chunk = buffer.copyOf(bufferPos)
-            val tail = chunk.copyOfRange(chunk.size - OVERLAP_SAMPLES, chunk.size)
+            val tail = chunk.copyOfRange(chunk.size - overlapSamples, chunk.size)
             tail.copyInto(buffer)
-            bufferPos = OVERLAP_SAMPLES
+            bufferPos = overlapSamples
+            // The carried-over overlap is prior speech, so it counts toward the
+            // next window's speech total.
+            speechSamples = overlapSamples
             silenceRun = 0
             // inSpeech stays true — we're mid-utterance, not at a real pause.
 
+            val submittedAt = System.currentTimeMillis()
             executor.execute {
+                val startedAt = System.currentTimeMillis()
                 val text = engine.transcribeBuffer(chunk)
-                if (text.isNotEmpty()) pendingText = stitch(pendingText, text)
+                pendingText = aggregate(pendingText, text)
+                Log.d(
+                    TAG, "splitFlush job done: queueWait=${startedAt - submittedAt}ms" +
+                        " work=${System.currentTimeMillis() - startedAt}ms" +
+                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
+                )
             }
         }
 
         /**
-         * Merges consecutive, overlapping transcript chunks into one
-         * continuous string. Because [splitFlush] carries shared audio into
-         * the next window, [next]'s leading words should re-transcribe
-         * roughly the same words [prev] ended with; find the longest such
-         * overlap (compared loosely, ignoring case/punctuation) and drop the
-         * duplicate. Falls back to plain concatenation if no overlap is
-         * found — never worse than the un-stitched result.
+         * Merges the text of two consecutive, overlapping windows
+         *
+         * The last word of [prev] and the first word of [next] sit right on
+         * a window boundary and may be truncated mid-word, so both are left
+         * out of the shared-word search and dropped from the result; with a
+         * [OVERLAP_SECONDS] overlap, each of them lies well inside the other
+         * window and is transcribed whole there. The longest run of words
+         * shared between the rest of [prev]'s tail and [next]'s head
+         * (compared ignoring case/punctuation) is kept only once.
          */
-        private fun stitch(prev: String, next: String): String {
-            if (prev.isEmpty()) return next
-            if (next.isEmpty()) return prev
+        private fun aggregate(prev: String, next: String): String {
+            val words = splitWords(prev)
+            val newWords = splitWords(next)
+            if (words.isEmpty() || newWords.isEmpty()) return (words + newWords).joinToString(" ")
 
-            val prevWords = prev.trim().split(Regex("\\s+"))
-            val nextWords = next.trim().split(Regex("\\s+"))
+            val tail = words.dropLast(1).map { normalizeWord(it) }
+            val head = newWords.drop(1).map { normalizeWord(it) }
 
-            val maxOverlap = minOf(prevWords.size, nextWords.size)
-            for (k in maxOverlap downTo 1) {
-                val prevTail = prevWords.subList(prevWords.size - k, prevWords.size)
-                val nextHead = nextWords.subList(0, k)
-                if (prevTail.indices.all { normalizeWord(prevTail[it]) == normalizeWord(nextHead[it]) }) {
-                    return (prevWords + nextWords.subList(k, nextWords.size)).joinToString(" ")
+            var numShared = 0
+            for (k in minOf(tail.size, head.size) downTo 1) {
+                if (tail.takeLast(k) == head.take(k)) {
+                    numShared = k
+                    break
                 }
             }
-            return "$prev $next"
+
+            // No shared run found — the windows didn't transcribe their common
+            // audio the same way. Dropping the boundary words is only safe when
+            // a match proves each of them was captured whole in the other
+            // window; without that proof, dropping them deletes real content
+            // silently. Keep everything and concatenate instead: a duplicated
+            // word at the seam is visible and recoverable, a missing one isn't.
+            if (numShared == 0) return (words + newWords).joinToString(" ")
+
+            return (words.dropLast(1) + newWords.drop(numShared + 1)).joinToString(" ")
         }
 
+        private fun splitWords(text: String): List<String> =
+            text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+
         private fun normalizeWord(word: String): String =
-            word.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
+            word.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() || it == '_' }
 
         private fun resetState() {
             bufferPos = 0
             inSpeech = false
             silenceRun = 0
+            speechSamples = 0
         }
+
+        /** Sample count as seconds, for logging. */
+        private fun Int.toSeconds(): Float = this.toFloat() / WhisperSplitEngine.SAMPLE_RATE
 
         override fun getResult(): String {
             val r = lastResult
@@ -268,13 +346,17 @@ class WhisperLocal(
 
             executor.execute {
                 val text = if (chunk != null) engine.transcribeBuffer(chunk) else ""
-                var combined = stitch(pendingText, text)
+                var combined = aggregate(pendingText, text)
                 pendingText = ""
                 // Fold in a not-yet-polled result too, in case a prior
                 // flush()'s job finished after the last acceptWaveForm poll.
+                // That's a separate utterance with no shared audio, so plain
+                // concatenation — aggregate() would drop its boundary words.
                 val existingReady = readyResult
                 readyResult = null
-                if (existingReady != null) combined = stitch(existingReady, combined)
+                if (existingReady != null) {
+                    combined = listOf(existingReady, combined).filter { it.isNotEmpty() }.joinToString(" ")
+                }
                 readyResult = combined.ifEmpty { null }
             }
             awaitDrain()
@@ -308,17 +390,40 @@ class WhisperLocal(
         companion object {
             // Ignore utterances shorter than 0.25 s (stray clicks/noise).
             private const val MIN_SPEECH_SAMPLES = WhisperSplitEngine.SAMPLE_RATE / 4
-            // ~0.4 s of silence ends an utterance and triggers transcription.
-            private const val PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 2 / 5
+            // ~0.8 s of silence ends an utterance, but only once
+            // MIN_UTTERANCE_SAMPLES of real speech has accumulated. Was 0.4 s,
+            // which fired on ordinary mid-sentence gaps and chopped one spoken
+            // sentence into seven fragments — four of them 0.6 s, which the
+            // model transcribes as gibberish. See the measurements in
+            // WHISPER_INTEGRATION_JOURNEY.md.
+            private const val PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 4 / 5
+            // A pause only ends an utterance once ~1.2 s of actual speech is
+            // buffered; below that the model has too little context and
+            // hallucinates. Measured: chunks >= 1.0 s transcribed sensibly,
+            // 0.6 s chunks produced garbage.
+            private const val MIN_UTTERANCE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 6 / 5
+            // ...but a long enough silence ends the utterance regardless of how
+            // little speech there is, so a genuine one-word reply still commits.
+            private const val LONG_PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 2
+            // How much trailing silence actually gets buffered (the rest is only
+            // counted). Enough to avoid clipping a word ending, little enough not
+            // to drag the buffer's average level below the engine's silence gate.
+            private const val TRAILING_SILENCE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 3 / 10
             // Per-frame RMS above this counts as speech (below ≈ noise/silence).
             // Device measurements: background noise ≈ 0.011, speech ≈ 0.025+.
             private const val SPEECH_RMS = 0.018f
-            // Trailing audio (~0.3 s) carried across a mid-utterance window
-            // split so a word cut by the split appears whole in the next
-            // window too, letting stitch() line the two chunks' text back up.
-            // Independent of the model's window size — this only needs to
-            // cover one word, not scale with a longer window.
-            private const val OVERLAP_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 3 / 10
+            // Trailing audio carried across a mid-utterance window split, so
+            // the boundary words aggregate() drops from one window are
+            // transcribed whole in the other. Requested value is clamped to
+            // half the window (see overlapSamples), so on the 5 s model this
+            // is 2.5 s carried → 2.5 s stride.
+            //
+            // This was briefly lowered to 2 s when an extra chunk cost ~4.8 s
+            // and chunks were backing up 2-3 s behind each other. The KV-cache
+            // decoder cut a chunk to ~1.9 s and removed the backlog entirely,
+            // so the extra chunk a longer overlap costs is now affordable and
+            // is worth spending on more reliable boundary merging.
+            private const val OVERLAP_SECONDS = 3
             // Safety bound for getFinalResult()'s drain wait. A larger model
             // window means more mel frames/encoder tokens per inference call,
             // so this is generous rather than tuned tightly to the 1s model's
