@@ -18,8 +18,8 @@ android {
         applicationId "com.volla.vollaboard"
         minSdkVersion 23
         targetSdkVersion 35
-        versionCode 402023
-        versionName "v4.2.3"
+        versionCode 402024
+        versionName "v4.2.4"
         ndkVersion "r25c"
         ndk {
         abiFilters "arm64-v8a"
@@ -36,6 +36,9 @@ android {
         }
     }
     buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+        }
         release {
             signingConfig signingConfigs.release
             minifyEnabled true
