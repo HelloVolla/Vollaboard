@@ -32,6 +32,7 @@ import androidx.compose.material.IconButton
 import androidx.compose.material.LinearProgressIndicator
 import androidx.compose.material.MaterialTheme
 import androidx.compose.material.Text
+import androidx.compose.material.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Delete
@@ -60,8 +61,11 @@ import androidx.lifecycle.MutableLiveData
 import com.volla.vollaboard.R
 import com.volla.vollaboard.SettingsActivity
 import com.volla.vollaboard.Tools
+import com.volla.vollaboard.data.InstalledModelReference
 import com.volla.vollaboard.data.ModelLink
+import com.volla.vollaboard.data.ModelType
 import com.volla.vollaboard.downloader.FileDownloader
+import com.volla.vollaboard.downloader.ZipTools
 import com.volla.vollaboard.downloader.messages.CancelCurrent
 import com.volla.vollaboard.downloader.messages.CancelFinished
 import com.volla.vollaboard.downloader.messages.CancelPending
@@ -84,6 +88,8 @@ import org.burnoutcrew.reorderable.reorderable
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
+import java.io.File
+import java.util.Locale
 
 data class DownloadModelProgress(
     val info: ModelInfo, var state: State, var progress: Float
@@ -105,6 +111,9 @@ class ModelsSettingsUi(private val activity: SettingsActivity) {
 
     private val currentDownloadingModel = MutableLiveData<DownloadModelProgress?>()
 
+    /** Paths of installed models that this build cannot use until they are replaced. */
+    private val outdatedModelsLD = MutableLiveData<Set<String>>(emptySet())
+
     private val recognizerSourceProviders = Providers(activity)
 
     fun onCreate() {
@@ -122,6 +131,28 @@ class ModelsSettingsUi(private val activity: SettingsActivity) {
             }
         }
         prefs.modelsOrder.set(currentModels)
+        outdatedModelsLD.postValue(
+            installedModels.filter { needsUpdate(it) }.map { it.path }.toSet()
+        )
+    }
+
+    /**
+     * A Whisper model with no meta file was installed by a build that predates the
+     * KV-cache decoder, so this app cannot run it. Vosk models are untouched by
+     * that change and are never flagged.
+     */
+    private fun needsUpdate(model: InstalledModelReference): Boolean =
+        model.type == ModelType.WHISPER && !File(model.path, ZipTools.MODEL_META_FILE).exists()
+
+    /**
+     * The download dialog deliberately hides installed models, so an update has to
+     * start the download itself rather than send the user there.
+     */
+    private fun downloadLinkFor(model: InstalledModelReference): ModelLink? {
+        val locale = Locale.forLanguageTag(File(model.path).name)
+        return ModelLink.values().find {
+            it.modelType == model.type && it.locale.language == locale.language
+        }
     }
 
 
@@ -130,6 +161,7 @@ class ModelsSettingsUi(private val activity: SettingsActivity) {
         val modelsPendingDownload by modelsPendingDownloadLD.observeAsState(mutableListOf())
         val currentDownloadingModel by currentDownloadingModel.observeAsState()
         val modelOrder by prefs.modelsOrder.observeAsState()
+        val outdatedModels by outdatedModelsLD.observeAsState(emptySet())
 
         var modelOrderData by remember {
             mutableStateOf(modelOrder)
@@ -282,6 +314,25 @@ class ModelsSettingsUi(private val activity: SettingsActivity) {
                                     fontSize = 20.sp
                                 )
                                 Text(text = item.path, fontSize = 12.sp)
+
+                                if (item.path in outdatedModels) {
+                                    Text(
+                                        text = stringResource(id = R.string.models_update_required),
+                                        fontSize = 14.sp,
+                                        color = MaterialTheme.colors.error
+                                    )
+                                    Text(
+                                        text = stringResource(id = R.string.models_update_required_explanation),
+                                        fontSize = 12.sp
+                                    )
+                                    downloadLinkFor(item)?.let { link ->
+                                        TextButton(onClick = {
+                                            FileDownloader.downloadModel(link, activity)
+                                        }) {
+                                            Text(text = stringResource(id = R.string.models_update_button))
+                                        }
+                                    }
+                                }
                             }
                             IconButton(onClick = {
                                 Tools.deleteModel(item, activity)

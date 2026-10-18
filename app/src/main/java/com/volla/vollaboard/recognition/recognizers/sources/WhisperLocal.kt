@@ -41,6 +41,10 @@ class WhisperLocal(
                 engine.initialize(modelDir, locale.language)
                 stateMLD.postValue(RecognizerState.READY)
                 Handler(Looper.getMainLooper()).post { onLoaded.onChanged(this) }
+            } catch (e: WhisperSplitEngine.OutdatedModelException) {
+                Log.e(TAG, "Model at $modelDir is outdated and must be re-downloaded", e)
+                stateMLD.postValue(RecognizerState.MODEL_OUTDATED)
+                Handler(Looper.getMainLooper()).post { onLoaded.onChanged(null) }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialise Whisper engine at $modelDir", e)
                 stateMLD.postValue(RecognizerState.ERROR)

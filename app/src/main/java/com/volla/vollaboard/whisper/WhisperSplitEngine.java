@@ -36,6 +36,17 @@ import java.util.Map;
 public class WhisperSplitEngine {
     private static final String TAG = "WhisperSplitEngine";
 
+    /**
+     * The installed model predates the KV-cache decoder export and cannot be run
+     * by this build. Distinct from a generic failure so the UI can tell the user
+     * to re-download rather than showing an unexplained error.
+     */
+    public static class OutdatedModelException extends IllegalStateException {
+        public OutdatedModelException(String message) {
+            super(message);
+        }
+    }
+
     public static final int SAMPLE_RATE = 16000;
 
     // Intra-op thread count for the TFLite interpreters. Measured on an
@@ -371,9 +382,9 @@ public class WhisperSplitEngine {
     private void detectDecoderLayout() {
         List<String> sigs = java.util.Arrays.asList(decoder.getSignatureKeys());
         if (!sigs.contains(SIG_PREFILL) || !sigs.contains(SIG_STEP)) {
-            throw new IllegalStateException("whisper_decoder.tflite has signatures " + sigs
+            throw new OutdatedModelException("whisper_decoder.tflite has signatures " + sigs
                     + "; expected the KV-cache decoder with '" + SIG_PREFILL
-                    + "' and '" + SIG_STEP + "' (see extract_decoder_cache.py)");
+                    + "' and '" + SIG_STEP );
         }
 
         // cross_k: [layers, 1, heads, encLen, headDim]
