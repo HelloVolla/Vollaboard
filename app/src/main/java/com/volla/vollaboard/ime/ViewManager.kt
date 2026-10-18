@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
@@ -106,7 +107,10 @@ class ViewManager(private val ime: Context) : AbstractComposeView(ime),
                         .height(height)
                         .background(MaterialTheme.colors.background)
                 ) {
-                    Column {
+                    // Without this the bottom row sits in the navigation bar strip,
+                    // where the system's hide-keyboard control overlaps the settings
+                    // button and swallows taps meant for it.
+                    Column(modifier = Modifier.navigationBarsPadding()) {
                         Row(verticalAlignment = Alignment.Top) {
                             IconButton(onClick = { listener?.backClicked() }) {
                                 Icon(
@@ -211,7 +215,10 @@ class ViewManager(private val ime: Context) : AbstractComposeView(ime),
                                 }
                             }
                         }
-                        Row {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        ) {
                             IconButton(onClick = { listener?.settingsClicked() }) {
                                 Icon(
                                     imageVector = Icons.Default.Settings,
@@ -259,6 +266,13 @@ class ViewManager(private val ime: Context) : AbstractComposeView(ime),
             RecognizerState.READY -> stateLD.setValue(STATE_READY)
             RecognizerState.IN_RAM -> stateLD.setValue(STATE_PAUSED)
             RecognizerState.ERROR -> stateLD.setValue(STATE_ERROR)
+
+            // Say what is actually wrong and what fixes it; a bare "Error" here
+            // leaves the user with a keyboard that silently types nothing.
+            RecognizerState.MODEL_OUTDATED -> {
+                errorMessageLD.setValue(R.string.mic_error_model_outdated)
+                stateLD.setValue(STATE_ERROR)
+            }
         }
     }
 
