@@ -75,36 +75,45 @@ object ZipTools {
         if (!foundAmFinalMDL && !foundWhisperModel) {
             Log.e(TAG, "Not a recognised model zip: ${archive.absolutePath}")
             errorObserver?.onChanged("Zip is not a Vosk model!")
-            tempUnzipLocation.delete()
+            deleteRecursive(tempUnzipLocation)
             return
         }
 
         val unzipFinalDestination = Constants.getDirectoryForModel(
             context, locale
         )
-        if (!unzipFinalDestination.exists()) {
-            unzipFinalDestination.mkdirs()
-        }
+        unzipFinalDestination.parentFile!!.mkdirs()
 
         Log.d(TAG, "Unzipping finished. Moving to ${unzipFinalDestination.absolutePath}")
 
-//        var moveSuccess: Boolean
-//        if (unzipFinalDestination.exists()) {
-//            moveSuccess = true
-//            for (f in tempUnzipLocation.listFiles()!!) {
-//                moveSuccess = f.renameTo(File(unzipFinalDestination, f.name))
-//                if (!moveSuccess) break
-//            }
-//            tempUnzipLocation.delete()
-//        } else {
-//            moveSuccess = tempUnzipLocation.renameTo(unzipFinalDestination)
-//        }
+        // Re-downloading a model must replace the installed one. renameTo() only
+        // succeeds onto a missing or empty directory, so move any existing model out
+        // of the way first - and keep it until the new one is in place, so a failure
+        // never leaves the user with no model at all. The holding folder lives outside
+        // Models/ because the providers treat every directory in there as installed.
+        val replacedLocation = File(tempUnzipLocation.parentFile, "Replaced")
+        if (replacedLocation.exists()) deleteRecursive(replacedLocation)
+
+        val hadPreviousModel = unzipFinalDestination.exists()
+        if (hadPreviousModel && !unzipFinalDestination.renameTo(replacedLocation)) {
+            Log.e(TAG, "Could not move aside existing model at ${unzipFinalDestination.absolutePath}")
+            errorObserver?.onChanged("Could not replace the installed model")
+            deleteRecursive(tempUnzipLocation)
+            return
+        }
 
         val moveSuccess = tempUnzipLocation.renameTo(unzipFinalDestination)
         if (!moveSuccess) {
-            Log.e(TAG, "Model exists at ${unzipFinalDestination.absolutePath}")
-            errorObserver?.onChanged("Model exists")
-            tempUnzipLocation.delete()
+            Log.e(TAG, "Could not install model to ${unzipFinalDestination.absolutePath}")
+            errorObserver?.onChanged("Could not install the model")
+            deleteRecursive(tempUnzipLocation)
+            if (hadPreviousModel) replacedLocation.renameTo(unzipFinalDestination)
+            return
+        }
+
+        if (hadPreviousModel) {
+            Log.d(TAG, "Replaced the previously installed model")
+            deleteRecursive(replacedLocation)
         }
     }
 
