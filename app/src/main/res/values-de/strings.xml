@@ -14,6 +14,7 @@
     <string name="mic_error_no_recognizers">Keine Erkennung installiert!</string>
     <string name="mic_error_no_permission">Mikrofon Erlaubniss nicht gewährt!</string>
     <string name="mic_error_recognizer_error">Erkennungs Fehler</string>
+    <string name="mic_error_model_outdated">Modell veraltet, in den Einstellungen aktualisieren</string>
     <string name="mic_error_mic_in_use">Mikrofon ist wird bereits benutzt!</string>
 
     <string name="model_dialog_title">WähleModel</string>
@@ -65,6 +66,9 @@
     <string name="models_pending_download_state">Status: Pending Download</string>
 
     <string name="models_model_display_name_null">Null</string>
+    <string name="models_update_required">Aktualisierung erforderlich</string>
+    <string name="models_update_required_explanation">Dieses Modell ist zu alt für diese Version der App.</string>
+    <string name="models_update_button">Aktualisieren</string>
 
     <string name="models_download_dialog_title">Download Modell</string>
 

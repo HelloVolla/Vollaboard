@@ -3,6 +3,7 @@ package com.volla.vollaboard.downloader
 import android.content.Context
 import android.util.Log
 import androidx.lifecycle.Observer
+import com.volla.vollaboard.BuildConfig
 import com.volla.vollaboard.Constants
 import com.volla.vollaboard.Tools.deleteRecursive
 import java.io.*
@@ -13,6 +14,17 @@ import java.util.zip.ZipFile
 
 object ZipTools {
     private const val TAG = "ZipTools"
+
+    /**
+     * Written into every model folder at install time. Its absence marks a model
+     * installed by an older build, which for Whisper means it predates the
+     * KV-cache decoder and has to be replaced. Safe to put here: the providers
+     * only ever look at directories, so this file is never mistaken for a model.
+     */
+    const val MODEL_META_FILE = ".model-meta.json"
+
+    /** Bumped when a model layout change makes previously installed models unusable. */
+    private const val MODEL_META_SCHEMA = 1
     private val localePattern: Pattern =
         Pattern.compile("vosk-model-(small-)?(\\w\\w(-\\w\\w)?)-(\\w+-)?v?\\d\\.?\\d*.*")
 
@@ -114,6 +126,22 @@ object ZipTools {
         if (hadPreviousModel) {
             Log.d(TAG, "Replaced the previously installed model")
             deleteRecursive(replacedLocation)
+        }
+
+        writeModelMeta(unzipFinalDestination)
+    }
+
+    private fun writeModelMeta(modelDir: File) {
+        try {
+            File(modelDir, MODEL_META_FILE).writeText(
+                """{"schema":$MODEL_META_SCHEMA,""" +
+                        """"installedAt":${System.currentTimeMillis()},""" +
+                        """"appVersionCode":${BuildConfig.VERSION_CODE}}"""
+            )
+        } catch (e: IOException) {
+            // Not fatal: the model itself installed fine. The worst case is that
+            // the model is reported as needing an update when it does not.
+            Log.w(TAG, "Could not write $MODEL_META_FILE to ${modelDir.absolutePath}", e)
         }
     }
 
