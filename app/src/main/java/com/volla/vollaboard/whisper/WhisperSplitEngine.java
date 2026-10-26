@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Whisper inference engine for the split-model TFLite format:
@@ -167,6 +168,21 @@ public class WhisperSplitEngine {
      * generated after them is returned.
      */
     public Result transcribeBuffer(float[] samples, int[] prefix) {
+        return transcribeBuffer(samples, prefix, null, null);
+    }
+
+    /** Receives the text tokens generated so far, after every new token. */
+    public interface TokenListener {
+        void onTokens(int[] generated);
+    }
+
+    /**
+     * As above, reporting each generated token to [listener] as it comes.
+     * Setting [cancel] stops the run after the encoder or between decoder
+     * steps; the encoder itself can't be interrupted.
+     */
+    public Result transcribeBuffer(float[] samples, int[] prefix, AtomicBoolean cancel,
+                                   TokenListener listener) {
         if (!initialized) return Result.EMPTY;
 
         long tStart = System.currentTimeMillis();
@@ -208,8 +224,12 @@ public class WhisperSplitEngine {
         float[] encoderOut = runEncoder(mel);
         if (encoderOut == null) return Result.EMPTY;
         long t2 = System.currentTimeMillis();
+        if (cancel != null && cancel.get()) {
+            Log.d(TAG, "transcribeBuffer: cancelled after encoder=" + (t2 - t1) + "ms");
+            return Result.EMPTY;
+        }
 
-        Result result = greedyDecode(encoderOut, prefix);
+        Result result = greedyDecode(encoderOut, prefix, cancel, listener);
         long t3 = System.currentTimeMillis();
 
         long decodeMs = t3 - t2;
@@ -264,7 +284,8 @@ public class WhisperSplitEngine {
     // Greedy decoder (KV-cached: prefill once, then one token per step)
     // =========================================================================
 
-    private Result greedyDecode(float[] encoderOut, int[] prefix) {
+    private Result greedyDecode(float[] encoderOut, int[] prefix, AtomicBoolean cancel,
+                                TokenListener listener) {
         int[] prompt = buildPrompt();
         // A dynamic prefill takes the whole prefix in one call; a fixed one
         // takes only the prompt, and the prefix is forced through step below.
@@ -298,12 +319,17 @@ public class WhisperSplitEngine {
 
             decoder.runSignature(inputs, outputs, SIG_PREFILL);
             tokens.add(forced < prefix.length ? prefix[forced++] : argmax(logits[0]));
+            report(tokens, prompt.length, forced, prefix.length, listener);
 
             // step: feed the last token plus the caches; the self K/V come
             // back one position longer. Prefix tokens are forced in place of
             // the argmax until the prefix is used up.
             while (tokens.get(tokens.size() - 1) != vocab.tokenEOT
                     && tokens.size() < MAX_TOKENS) {
+                if (cancel != null && cancel.get()) {
+                    stopReason = "cancelled";
+                    break;
+                }
                 int cacheLen = selfK[0][0][0].length;
                 float[][][][][] nextK = newSelfKv(cacheLen + 1);
                 float[][][][][] nextV = newSelfKv(cacheLen + 1);
@@ -325,6 +351,7 @@ public class WhisperSplitEngine {
                 selfK = nextK;
                 selfV = nextV;
                 tokens.add(forced < prefix.length ? prefix[forced++] : argmax(logits[0]));
+                report(tokens, prompt.length, forced, prefix.length, listener);
             }
             if (tokens.get(tokens.size() - 1) == vocab.tokenEOT) stopReason = "EOT";
         } catch (Exception e) {
@@ -372,6 +399,21 @@ public class WhisperSplitEngine {
                 .replaceAll("\\s+", " ")
                 .trim();
         return cleaned;
+    }
+
+    /**
+     * Passes the text tokens generated so far to [listener], once the prefix
+     * is used up and the newest token is real text (not EOT/special).
+     */
+    private void report(List<Integer> tokens, int promptLen, int forced, int prefixLen,
+                        TokenListener listener) {
+        int last = tokens.get(tokens.size() - 1);
+        if (listener == null || forced < prefixLen || last >= vocab.tokenEOT) return;
+        List<Integer> generated = new ArrayList<>();
+        for (int i = promptLen + forced; i < tokens.size(); i++) {
+            if (tokens.get(i) < vocab.tokenEOT) generated.add(tokens.get(i));
+        }
+        listener.onTokens(toIntArray(generated));
     }
 
     /** True when [token] begins a new word (BPE marks a leading space with 'Ġ'). */

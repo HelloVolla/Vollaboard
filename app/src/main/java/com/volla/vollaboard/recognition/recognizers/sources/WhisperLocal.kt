@@ -121,6 +121,12 @@ class WhisperLocal(
         // up behind each other when a run is slower than UPDATE_SAMPLES.
         private val updateBusy = AtomicBoolean(false)
 
+        // Cancel flag of the newest update run. A commit submitted after it
+        // covers the same audio and more, so it sets this flag: the update is
+        // skipped if it hasn't started, or its decoding stops if it has.
+        // Capture thread only (the job keeps its own reference).
+        private var updateCancel = AtomicBoolean(false)
+
         // Executor-only: tokens already typed for the audio in the buffer, and
         // the tentative tokens of the previous update run.
         private var committedTokens = IntArray(0)
@@ -155,7 +161,11 @@ class WhisperLocal(
                     speechSamples += bufferPos - before
                     sinceUpdate += bufferPos - before
 
-                    if (sinceUpdate >= UPDATE_SAMPLES && speechSamples >= MIN_UTTERANCE_SAMPLES
+                    // With committed context, a run with little new speech
+                    // just ends right after the forced prefix, so it waits
+                    // for more speech before the first update.
+                    val minSpeech = if (committedPos > 0) UPDATE_AFTER_COMMIT_SAMPLES else MIN_UTTERANCE_SAMPLES
+                    if (sinceUpdate >= UPDATE_SAMPLES && speechSamples >= minSpeech
                         && updateBusy.compareAndSet(false, true)
                     ) {
                         sinceUpdate = 0
@@ -257,11 +267,32 @@ class WhisperLocal(
         /** Snapshots the buffer and transcribes it from the start on the executor. */
         private fun submit(mode: Mode) {
             val chunk = buffer.copyOf(bufferPos)
+            val cancel = if (mode == Mode.UPDATE) {
+                AtomicBoolean(false).also { updateCancel = it }
+            } else {
+                updateCancel.set(true)
+                null
+            }
             val submittedAt = System.currentTimeMillis()
             executor.execute {
                 val startedAt = System.currentTimeMillis()
                 try {
-                    val hyp = engine.transcribeBuffer(chunk, committedTokens).tokens
+                    if (cancel?.get() == true) {
+                        Log.d(TAG, "UPDATE skipped: a commit came after it")
+                        return@execute
+                    }
+                    // Show every token as the decoder produces it. All of it
+                    // is after committedTokens, so all of it is still tentative.
+                    val result = engine.transcribeBuffer(chunk, committedTokens, cancel) { generated ->
+                        partialText = engine.tokensToText(generated)
+                    }
+                    // Stopped mid-run: its tokens are incomplete, and the
+                    // commit queued behind it commits everything anyway.
+                    if (cancel?.get() == true) {
+                        Log.d(TAG, "UPDATE stopped: a commit came after it")
+                        return@execute
+                    }
+                    val hyp = result.tokens
                     val n = if (mode == Mode.UPDATE) agreedLength(tentative, hyp) else hyp.size
                     if (n > 0) {
                         val newTokens = hyp.copyOf(n)
@@ -393,6 +424,7 @@ class WhisperLocal(
             // New speech between in-speech update runs. A run takes ~1.5-2 s,
             // and updateBusy skips any that would queue behind a running one.
             private const val UPDATE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE
+            private const val UPDATE_AFTER_COMMIT_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 1
             // Context kept when the window fills (the rest is freed).
             private const val KEEP_SECONDS = 10
             // Safety bound for getFinalResult()'s drain wait.
