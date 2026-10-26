@@ -15,6 +15,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
 class WhisperLocal(
@@ -61,9 +62,7 @@ class WhisperLocal(
 
     /**
      * Buffers 16 kHz PCM audio from MySpeechService using simple energy-based
-     * voice-activity detection (VAD): leading silence is dropped, speech is
-     * accumulated from its onset, and the utterance is transcribed when the
-     * speaker pauses.
+     * voice-activity detection (VAD) and transcribes it with Whisper.
      *
      * MySpeechService reads the microphone and calls acceptWaveForm on a
      * single thread in a tight loop; if that call blocks for as long as
@@ -71,21 +70,17 @@ class WhisperLocal(
      * AudioRecord buffer — sized for only ~0.2s — silently drops everything
      * spoken during the stall. So transcription runs on a dedicated
      * background executor: acceptWaveForm only ever does cheap VAD
-     * bookkeeping and returns immediately, keeping the capture loop reading
-     * the microphone continuously.
+     * Every run encodes the audio from the beginning, not just the newest
+     * part, so the model always hears the whole context.
+     * Tokens already typed are passed to the engine as a forced prefix,
+     * which rebuilds the decoder's KV cache in
+     * one prefill call, and only the text after them is generated.
      *
-     * The model itself only ever sees a fixed window at a time (the mel
-     * extractor's input length, read from the loaded model — [maxSamples]).
-     * For utterances longer than that, each window is transcribed as soon as
-     * the buffer fills, but the result is held rather than committed
-     * immediately: MySpeechService types
-     * whatever acceptWaveForm's "true" return causes it to fetch, and that
-     * type is irreversible, so we can't fix up text after the fact the way a
-     * redrawable streaming display could. Instead, consecutive windows overlap
-     * by [OVERLAP_SECONDS] of raw audio — capped at half the window, so 2.5s
-     * carried and a 2.5s stride on the 5s model — and each chunk's text is
-     * merged onto the held text with aggregate(), only emitting the combined
-     * result once a real pause ends the utterance.
+     * Typed text can't be revised, so while the user is still speaking only
+     * the words two consecutive runs agree on are committed (LocalAgreement);
+     * the rest stays tentative. At a pause everything is committed. The audio
+     * is kept as context until the window ([maxSamples]) fills; then only the
+     * last [keepSamples] are kept, and a long pause clears everything.
      */
     private class WhisperRecognizer(
         private val engine: WhisperSplitEngine,
@@ -95,42 +90,49 @@ class WhisperLocal(
         override val sampleRate: Float = WhisperSplitEngine.SAMPLE_RATE.toFloat()
 
         // Runs every engine.transcribeBuffer() call, off the capture thread.
-        // Single-threaded so chunks are transcribed and merged in order.
         private val executor = Executors.newSingleThreadExecutor()
 
-        // The model's actual window size, read from the loaded .tflite file
-        // rather than assumed — a re-exported model with a longer window
-        // (e.g. 5s) is picked up automatically. Resolved lazily on first use
-        // (the mic capture loop that calls acceptWaveForm only ever starts
-        // after engine.initialize() has already completed).
+        // The model's window, read from the loaded mel extractor (30s once
+        // re-exported). Resolved lazily: capture only starts after
+        // engine.initialize() has completed.
         private val maxSamples: Int by lazy { engine.getMelInputSamples() }
 
-        // Speech is accumulated here (float [-1, 1]); capped at the model's window.
-        // Owned by the capture thread only.
+        // All audio since the last reset (float [-1, 1]). Capture thread only.
         private val buffer: FloatArray by lazy { FloatArray(maxSamples) }
 
-        // Audio carried from one window into the next on a split. Capped at
-        // half the window so a smaller model (e.g. 1s) still advances.
-        private val overlapSamples: Int by lazy {
-            minOf(OVERLAP_SECONDS * WhisperSplitEngine.SAMPLE_RATE, maxSamples / 2)
+        // Audio kept as context when the window fills: 10s on the 30s model,
+        // capped at a third of the window so a smaller model still frees room.
+        private val keepSamples: Int by lazy {
+            minOf(KEEP_SECONDS * WhisperSplitEngine.SAMPLE_RATE, maxSamples / 3)
         }
         private var bufferPos = 0
+        // End of the audio already committed at a pause. Noise after it that
+        // turns out too short to be speech is dropped back to here.
+        private var committedPos = 0
         private var inSpeech = false
         private var silenceRun = 0          // consecutive silent samples while in speech
-        // Buffered samples that were actually speech (excludes the trailing
-        // silence appended during a pause). This — not bufferPos — decides
-        // whether there's enough real speech for a pause to end the utterance.
+        // Real speech since the last pause (excludes appended trailing silence).
         private var speechSamples = 0
+        // Speech appended since the last in-speech update run.
+        private var sinceUpdate = 0
         private var lastResult = ""
 
-        // Text held across a mid-utterance buffer split, not yet committed.
-        // Touched only inside executor jobs — never from the capture thread.
-        private var pendingText = ""
+        // Set while an update run is queued or running, so updates don't pile
+        // up behind each other when a run is slower than UPDATE_SAMPLES.
+        private val updateBusy = AtomicBoolean(false)
 
-        // Cross-thread handoff for a finished, ready-to-commit utterance.
-        // Single writer (executor), single reader (capture thread via
-        // pollReady); a one-tick (~0.2s) delivery delay is harmless.
+        // Executor-only: tokens already typed for the audio in the buffer, and
+        // the tentative tokens of the previous update run.
+        private var committedTokens = IntArray(0)
+        private var tentative = IntArray(0)
+
+        // Text of [tentative], shown as composing (replaceable) text until
+        // it is committed. Written by the executor, read by the capture thread.
         @Volatile
+        private var partialText = ""
+
+        // Committed text waiting to be fetched by the capture thread.
+        private val readyLock = Any()
         private var readyResult: String? = null
 
         override fun acceptWaveForm(buffer: ShortArray?, nread: Int): Boolean {
@@ -151,47 +153,67 @@ class WhisperLocal(
                     val before = bufferPos
                     appendFrame(buffer, nread)
                     speechSamples += bufferPos - before
+                    sinceUpdate += bufferPos - before
+
+                    if (sinceUpdate >= UPDATE_SAMPLES && speechSamples >= MIN_UTTERANCE_SAMPLES
+                        && updateBusy.compareAndSet(false, true)
+                    ) {
+                        sinceUpdate = 0
+                        submit(Mode.UPDATE)
+                    }
                 } else if (inSpeech) {
-                    // Keep a SHORT tail of silence so word endings aren't clipped —
-                    // but stop there, and keep counting the rest only for pause
-                    // detection. Appending the whole pause dilutes the buffer's
-                    // average level until the engine's silence gate throws real
-                    // speech away: measured, a 0.7s utterance followed by 2.2s of
-                    // appended silence came to rms 0.0154 against a 0.015 gate, and
-                    // the end of the sentence was discarded without ever reaching
-                    // the model. It also stops a long pause from inflating the
-                    // buffer to the window size and triggering a pointless split.
+                    // Keep a SHORT tail of silence so word endings aren't
+                    // clipped; appending the whole pause dilutes the buffer's
+                    // level until the engine's silence gate drops real speech.
                     if (silenceRun < TRAILING_SILENCE_SAMPLES) appendFrame(buffer, nread)
                     silenceRun += nread
 
                     // A pause only ends the utterance once enough actual speech
-                    // has accumulated. Natural mid-sentence gaps are frequently
-                    // longer than PAUSE_SAMPLES, and committing there chops a
-                    // sentence into sub-second fragments that the model cannot
-                    // transcribe (it hallucinates on them). A much longer silence
-                    // ends the utterance regardless, so a genuinely short one-word
-                    // utterance still gets committed.
+                    // has accumulated; a much longer silence ends it regardless,
+                    // so a genuine one-word reply still commits.
                     val enoughSpeech = speechSamples >= MIN_UTTERANCE_SAMPLES
-                    if (enoughSpeech && silenceRun >= PAUSE_SAMPLES) {
-                        flush("pause")
-                    } else if (silenceRun >= LONG_PAUSE_SAMPLES) {
-                        flush("long-pause")
+                    if ((enoughSpeech && silenceRun >= PAUSE_SAMPLES) || silenceRun >= LONG_PAUSE_SAMPLES) {
+                        pause()
+                    }
+                } else if (bufferPos > 0) {
+                    // Silence after a pause, with audio still kept as context.
+                    // A long pause means a new topic: drop all buffers so the
+                    // next speech starts fresh.
+                    silenceRun += nread
+                    if (silenceRun >= LONG_PAUSE_SAMPLES) {
+                        Log.d(TAG, "long pause — resetting all buffers")
+                        resetState()
+                        executor.execute {
+                            committedTokens = IntArray(0)
+                            tentative = IntArray(0)
+                            partialText = ""
+                        }
                     }
                 }
                 // Otherwise: leading silence before any speech — ignore it.
 
-                // Can't hold more than the model's window, but speech is still
-                // ongoing (no pause yet) — hold the transcript, don't commit it.
-                if (bufferPos >= maxSamples) splitFlush()
+                // Window full: commit everything, then keep only the last
+                // keepSamples as context and free the rest of the buffer.
+                if (bufferPos >= maxSamples) {
+                    Log.d(
+                        TAG, "window full (${maxSamples.toSeconds()}s) — committing," +
+                            " keeping the last ${keepSamples.toSeconds()}s"
+                    )
+                    submit(Mode.TRIM)
+                    buffer.copyInto(buffer, 0, bufferPos - keepSamples, bufferPos)
+                    bufferPos = keepSamples
+                    committedPos = keepSamples
+                    speechSamples = 0
+                    sinceUpdate = 0
+                }
             }
-            // Deliver whatever utterance finished transcribing in the
-            // background since the last call, if any.
             return pollReady()
         }
 
         private fun pollReady(): Boolean {
-            val r = readyResult ?: return false
-            readyResult = null
+            val r = synchronized(readyLock) {
+                readyResult.also { readyResult = null }
+            } ?: return false
             lastResult = r
             return true
         }
@@ -205,128 +227,95 @@ class WhisperLocal(
             }
         }
 
-        /**
-         * A real pause ended the utterance: snapshot whatever's left and
-         * hand it to the background executor, which transcribes it, merges
-         * it onto any text held from earlier splits, and makes the combined
-         * result available via [readyResult]. Full VAD reset here on the
-         * capture thread — this is a genuine boundary — but the transcript
-         * itself isn't ready until the executor job runs.
-         */
-        private fun flush(reason: String) {
-            val len = bufferPos
-            val speech = speechSamples
+        /** A pause ended the utterance: commit all of it, keep the audio as context. */
+        private fun pause() {
             Log.d(
-                TAG, "flush($reason): speechSeconds=${speech.toSeconds()}" +
-                    " bufferSeconds=${len.toSeconds()} silenceSeconds=${silenceRun.toSeconds()}"
+                TAG, "pause: speechSeconds=${speechSamples.toSeconds()}" +
+                    " bufferSeconds=${bufferPos.toSeconds()}"
             )
-            resetState()
-            // Judge "too short to be a word" on real speech, not on a buffer
-            // that may be mostly trailing silence.
-            val chunk = if (speech < MIN_SPEECH_SAMPLES) null else buffer.copyOf(len)
-            if (chunk == null) Log.d(TAG, "flush($reason): discarded, too little speech")
-
-            val submittedAt = System.currentTimeMillis()
-            executor.execute {
-                val startedAt = System.currentTimeMillis()
-                val text = if (chunk != null) engine.transcribeBuffer(chunk) else ""
-                val combined = aggregate(pendingText, text)
-                pendingText = ""
-                if (combined.isNotEmpty()) readyResult = combined
-                Log.d(
-                    TAG, "flush($reason) job done: queueWait=${startedAt - submittedAt}ms" +
-                        " work=${System.currentTimeMillis() - startedAt}ms" +
-                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
-                )
+            if (speechSamples < MIN_SPEECH_SAMPLES) {
+                Log.d(TAG, "pause: discarded, too little speech")
+                bufferPos = committedPos
+            } else {
+                submit(Mode.COMMIT)
+                committedPos = bufferPos
             }
+            inSpeech = false
+            // silenceRun keeps counting, so a long pause is measured from the
+            // end of speech, not from this commit.
+            speechSamples = 0
+            sinceUpdate = 0
         }
 
-        /**
-         * The model's window filled but speech is still ongoing (no pause
-         * yet): hand this window to the background executor and hold its
-         * text rather than committing it, since MySpeechService types a
-         * committed result immediately and it can't be revised afterwards.
-         * Carry the trailing overlap of raw audio into the next window so the
-         * words at this split sit well inside the next window too, and
-         * aggregate the two chunks' text once the next one arrives.
-         */
-        private fun splitFlush() {
-            Log.d(
-                TAG, "splitFlush: window full (${maxSamples.toSeconds()}s) with no pause —" +
-                    " holding text to aggregate with the next window"
-            )
+        private enum class Mode {
+            UPDATE,  // still speaking: commit only the agreed words
+            COMMIT,  // pause: commit everything, keep the audio as context
+            TRIM,    // window full: commit everything, keep the last keepSamples as context
+            RESET    // end: commit everything, then drop the context
+        }
+
+        /** Snapshots the buffer and transcribes it from the start on the executor. */
+        private fun submit(mode: Mode) {
             val chunk = buffer.copyOf(bufferPos)
-            val tail = chunk.copyOfRange(chunk.size - overlapSamples, chunk.size)
-            tail.copyInto(buffer)
-            bufferPos = overlapSamples
-            // The carried-over overlap is prior speech, so it counts toward the
-            // next window's speech total.
-            speechSamples = overlapSamples
-            silenceRun = 0
-            // inSpeech stays true — we're mid-utterance, not at a real pause.
-
             val submittedAt = System.currentTimeMillis()
             executor.execute {
                 val startedAt = System.currentTimeMillis()
-                val text = engine.transcribeBuffer(chunk)
-                pendingText = aggregate(pendingText, text)
+                try {
+                    val hyp = engine.transcribeBuffer(chunk, committedTokens).tokens
+                    val n = if (mode == Mode.UPDATE) agreedLength(tentative, hyp) else hyp.size
+                    if (n > 0) {
+                        val newTokens = hyp.copyOf(n)
+                        committedTokens += newTokens
+                        emit(engine.tokensToText(newTokens))
+                    }
+                    tentative = if (mode == Mode.UPDATE) hyp.copyOfRange(n, hyp.size) else IntArray(0)
+                    partialText = engine.tokensToText(tentative)
+                    if (mode == Mode.RESET) committedTokens = IntArray(0)
+                    if (mode == Mode.TRIM) {
+                        // There are no timestamps to tell which committed
+                        // tokens belong to the kept audio, so transcribe it
+                        // alone and use that as the new prefix. Not typed —
+                        // its text was already committed above.
+                        val kept = chunk.copyOfRange(chunk.size - keepSamples, chunk.size)
+                        committedTokens = engine.transcribeBuffer(kept, IntArray(0)).tokens
+                    }
+                } finally {
+                    if (mode == Mode.UPDATE) updateBusy.set(false)
+                }
                 Log.d(
-                    TAG, "splitFlush job done: queueWait=${startedAt - submittedAt}ms" +
+                    TAG, "$mode job done: queueWait=${startedAt - submittedAt}ms" +
                         " work=${System.currentTimeMillis() - startedAt}ms" +
-                        " sinceSubmit=${System.currentTimeMillis() - submittedAt}ms"
+                        " committedTokens=${committedTokens.size} tentative=${tentative.size}"
                 )
             }
         }
 
         /**
-         * Merges the text of two consecutive, overlapping windows
-         *
-         * The last word of [prev] and the first word of [next] sit right on
-         * a window boundary and may be truncated mid-word, so both are left
-         * out of the shared-word search and dropped from the result; with a
-         * [OVERLAP_SECONDS] overlap, each of them lies well inside the other
-         * window and is transcribed whole there. The longest run of words
-         * shared between the rest of [prev]'s tail and [next]'s head
-         * (compared ignoring case/punctuation) is kept only once.
+         * Length of the shared token prefix of [prev] and [next], cut back to
+         * a word boundary so a word is never typed in two halves.
          */
-        private fun aggregate(prev: String, next: String): String {
-            val words = splitWords(prev)
-            val newWords = splitWords(next)
-            if (words.isEmpty() || newWords.isEmpty()) return (words + newWords).joinToString(" ")
-
-            val tail = words.dropLast(1).map { normalizeWord(it) }
-            val head = newWords.drop(1).map { normalizeWord(it) }
-
-            var numShared = 0
-            for (k in minOf(tail.size, head.size) downTo 1) {
-                if (tail.takeLast(k) == head.take(k)) {
-                    numShared = k
-                    break
-                }
-            }
-
-            // No shared run found — the windows didn't transcribe their common
-            // audio the same way. Dropping the boundary words is only safe when
-            // a match proves each of them was captured whole in the other
-            // window; without that proof, dropping them deletes real content
-            // silently. Keep everything and concatenate instead: a duplicated
-            // word at the seam is visible and recoverable, a missing one isn't.
-            if (numShared == 0) return (words + newWords).joinToString(" ")
-
-            return (words.dropLast(1) + newWords.drop(numShared + 1)).joinToString(" ")
+        private fun agreedLength(prev: IntArray, next: IntArray): Int {
+            var n = 0
+            while (n < prev.size && n < next.size && prev[n] == next[n]) n++
+            while (n > 0 && (n >= next.size || !engine.isWordStart(next[n]))) n--
+            return n
         }
 
-        private fun splitWords(text: String): List<String> =
-            text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-
-        private fun normalizeWord(word: String): String =
-            word.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() || it == '_' }
+        /** Appends committed text to [readyResult] for the capture thread. */
+        private fun emit(text: String) {
+            if (text.isEmpty()) return
+            synchronized(readyLock) {
+                readyResult = readyResult?.let { "$it $text" } ?: text
+            }
+        }
 
         private fun resetState() {
             bufferPos = 0
+            committedPos = 0
             inSpeech = false
             silenceRun = 0
             speechSamples = 0
+            sinceUpdate = 0
         }
 
         /** Sample count as seconds, for logging. */
@@ -338,36 +327,23 @@ class WhisperLocal(
             return r
         }
 
-        override fun getPartialResult(): String = ""
+        // Held back while a commit is waiting: the commit replaces the
+        // composing text, so showing the newer partial first would flicker.
+        override fun getPartialResult(): String =
+            if (synchronized(readyLock) { readyResult } != null) "" else partialText
 
         override fun getFinalResult(): String {
-            // Flush any buffered speech when recognition ends. Capture has
+            // Commit any buffered speech when recognition ends. Capture has
             // already stopped at this point, so blocking here to drain the
             // executor is safe and bounded by awaitDrain()'s timeout.
-            val len = bufferPos
+            if (bufferPos - committedPos >= MIN_SPEECH_SAMPLES) submit(Mode.RESET)
+            else executor.execute { committedTokens = IntArray(0); tentative = IntArray(0); partialText = "" }
             resetState()
-            val chunk = if (len in MIN_SPEECH_SAMPLES..maxSamples) buffer.copyOf(len) else null
-
-            executor.execute {
-                val text = if (chunk != null) engine.transcribeBuffer(chunk) else ""
-                var combined = aggregate(pendingText, text)
-                pendingText = ""
-                // Fold in a not-yet-polled result too, in case a prior
-                // flush()'s job finished after the last acceptWaveForm poll.
-                // That's a separate utterance with no shared audio, so plain
-                // concatenation — aggregate() would drop its boundary words.
-                val existingReady = readyResult
-                readyResult = null
-                if (existingReady != null) {
-                    combined = listOf(existingReady, combined).filter { it.isNotEmpty() }.joinToString(" ")
-                }
-                readyResult = combined.ifEmpty { null }
-            }
             awaitDrain()
 
-            val r = readyResult
-            readyResult = null
-            return r ?: ""
+            return synchronized(readyLock) {
+                readyResult.also { readyResult = null }
+            } ?: ""
         }
 
         /** Blocks until every job queued on [executor] so far has completed. */
@@ -384,10 +360,12 @@ class WhisperLocal(
         override fun reset() {
             resetState()
             lastResult = ""
-            readyResult = null
+            synchronized(readyLock) { readyResult = null }
             executor.execute {
-                pendingText = ""
-                readyResult = null
+                committedTokens = IntArray(0)
+                tentative = IntArray(0)
+                partialText = ""
+                synchronized(readyLock) { readyResult = null }
             }
         }
 
@@ -395,19 +373,15 @@ class WhisperLocal(
             // Ignore utterances shorter than 0.25 s (stray clicks/noise).
             private const val MIN_SPEECH_SAMPLES = WhisperSplitEngine.SAMPLE_RATE / 4
             // ~0.8 s of silence ends an utterance, but only once
-            // MIN_UTTERANCE_SAMPLES of real speech has accumulated. Was 0.4 s,
-            // which fired on ordinary mid-sentence gaps and chopped one spoken
-            // sentence into seven fragments — four of them 0.6 s, which the
-            // model transcribes as gibberish. See the measurements in
-            // WHISPER_INTEGRATION_JOURNEY.md.
+            // MIN_UTTERANCE_SAMPLES of real speech has accumulated. Shorter
+            // gaps fired on ordinary mid-sentence pauses. See the measurements
+            // in WHISPER_INTEGRATION_JOURNEY.md.
             private const val PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 4 / 5
-            // A pause only ends an utterance once ~1.2 s of actual speech is
-            // buffered; below that the model has too little context and
+            // Below ~1.2 s of speech the model has too little context and
             // hallucinates. Measured: chunks >= 1.0 s transcribed sensibly,
             // 0.6 s chunks produced garbage.
             private const val MIN_UTTERANCE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 6 / 5
-            // ...but a long enough silence ends the utterance regardless of how
-            // little speech there is, so a genuine one-word reply still commits.
+            // ...but a long enough silence ends the utterance regardless.
             private const val LONG_PAUSE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE * 2
             // How much trailing silence actually gets buffered (the rest is only
             // counted). Enough to avoid clipping a word ending, little enough not
@@ -416,22 +390,12 @@ class WhisperLocal(
             // Per-frame RMS above this counts as speech (below ≈ noise/silence).
             // Device measurements: background noise ≈ 0.011, speech ≈ 0.025+.
             private const val SPEECH_RMS = 0.018f
-            // Trailing audio carried across a mid-utterance window split, so
-            // the boundary words aggregate() drops from one window are
-            // transcribed whole in the other. Requested value is clamped to
-            // half the window (see overlapSamples), so on the 5 s model this
-            // is 2.5 s carried → 2.5 s stride.
-            //
-            // This was briefly lowered to 2 s when an extra chunk cost ~4.8 s
-            // and chunks were backing up 2-3 s behind each other. The KV-cache
-            // decoder cut a chunk to ~1.9 s and removed the backlog entirely,
-            // so the extra chunk a longer overlap costs is now affordable and
-            // is worth spending on more reliable boundary merging.
-            private const val OVERLAP_SECONDS = 3
-            // Safety bound for getFinalResult()'s drain wait. A larger model
-            // window means more mel frames/encoder tokens per inference call,
-            // so this is generous rather than tuned tightly to the 1s model's
-            // observed ~3s/chunk — just a backstop against hanging forever.
+            // New speech between in-speech update runs. A run takes ~1.5-2 s,
+            // and updateBusy skips any that would queue behind a running one.
+            private const val UPDATE_SAMPLES = WhisperSplitEngine.SAMPLE_RATE
+            // Context kept when the window fills (the rest is freed).
+            private const val KEEP_SECONDS = 10
+            // Safety bound for getFinalResult()'s drain wait.
             private const val DRAIN_TIMEOUT_MS = 30_000L
         }
     }
